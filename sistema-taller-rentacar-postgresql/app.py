@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import io
 import os
 import sqlite3
@@ -9,9 +8,12 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, Response, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "taller_rentacar.db"
@@ -54,6 +56,50 @@ def db():
     if "db" not in g:
         g.db = Database()
     return g.db
+
+
+def excel_file(title: str, headers: list[str], rows: list[list], currency_columns=()):
+    """Creates a readable Excel workbook for reports and invoice folders."""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Reporte"
+    last_column = len(headers)
+    sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_column)
+    title_cell = sheet.cell(1, 1, title)
+    title_cell.font = Font(bold=True, color="FFFFFF", size=15)
+    title_cell.fill = PatternFill("solid", fgColor="0B5CAD")
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    sheet.row_dimensions[1].height = 28
+    header_fill = PatternFill("solid", fgColor="D9EAFE")
+    thin_blue = Side(style="thin", color="B7D3EE")
+    for column, header in enumerate(headers, start=1):
+        cell = sheet.cell(3, column, header)
+        cell.font = Font(bold=True, color="164D85")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(bottom=thin_blue)
+    for row_number, values in enumerate(rows, start=4):
+        for column, value in enumerate(values, start=1):
+            cell = sheet.cell(row_number, column, value)
+            cell.alignment = Alignment(vertical="top", wrap_text=column not in currency_columns)
+            cell.border = Border(bottom=Side(style="hair", color="DCEAF7"))
+            if column in currency_columns:
+                cell.number_format = '$#,##0.00'
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+        if row_number % 2 == 0:
+            for column in range(1, last_column + 1):
+                sheet.cell(row_number, column).fill = PatternFill("solid", fgColor="F4F9FF")
+    sheet.freeze_panes = "A4"
+    sheet.auto_filter.ref = f"A3:{get_column_letter(last_column)}{max(3, len(rows) + 3)}"
+    for column in range(1, last_column + 1):
+        values = [str(sheet.cell(row, column).value or "") for row in range(3, min(len(rows) + 4, 60))]
+        width = min(max(max((len(value) for value in values), default=10) + 2, 12), 42)
+        sheet.column_dimensions[get_column_letter(column)].width = width
+    sheet.sheet_view.showGridLines = False
+    payload = io.BytesIO()
+    workbook.save(payload)
+    payload.seek(0)
+    return payload
 
 
 @app.teardown_appcontext
@@ -697,12 +743,15 @@ def download_invoice_folder(folder_id):
     if not folder:
         flash("Carpeta no encontrada.", "warning"); return redirect(url_for("invoices"))
     records = db().execute("SELECT * FROM invoices WHERE folder_id=? ORDER BY paid_date, id", (folder_id,)).fetchall()
-    text = io.StringIO(); writer = csv.writer(text)
-    writer.writerow(["Fecha", "Descripción", "Monto", "Estado", "Notas"])
-    for row in records: writer.writerow([row["paid_date"], row["description"], f"{row['amount']:.2f}", row["status"], row["notes"]])
+    workbook = excel_file(
+        f"Facturas — {folder['name']}",
+        ["Fecha", "Descripción", "Monto", "Estado", "Notas"],
+        [[row["paid_date"], row["description"], float(row["amount"]), row["status"], row["notes"]] for row in records],
+        currency_columns=(3,),
+    )
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(f"{secure_filename(folder['name']) or 'facturas'}.csv", "\ufeff" + text.getvalue())
+        archive.writestr(f"{secure_filename(folder['name']) or 'facturas'}.xlsx", workbook.getvalue())
     payload.seek(0)
     audit("Facturas", "Descargó carpeta", folder["name"]); db().commit()
     return send_file(payload, mimetype="application/zip", as_attachment=True, download_name=f"facturas_{secure_filename(folder['name'])}.zip")
@@ -741,9 +790,9 @@ def reports():
     return render_template("reports.html", records=records, start=start, end=end, category=category, totals=totals)
 
 
-@app.route("/reportes/csv")
+@app.route("/reportes/excel")
 @login_required
-def report_csv():
+def report_excel():
     start, end = selected_range()
     category = request.args.get("category", "todos")
     query, params = "SELECT * FROM incomes WHERE income_date BETWEEN ? AND ?", [start, end]
@@ -751,14 +800,12 @@ def report_csv():
         query += " AND category = ?"; params.append(category)
     income_rows = db().execute(query + " ORDER BY income_date, id", params).fetchall() if category not in ("gasto", "reserva") else []
     expense_rows = db().execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ? ORDER BY expense_date, id", (start, end)).fetchall() if category in ("todos", "gasto") else []
-    from io import StringIO
-    output = StringIO(); writer = csv.writer(output)
-    writer.writerow(["Fecha", "Tipo", "Área", "Descripción", "Monto", "Observaciones"])
-    writer.writerows([[r["income_date"], "Ingreso", r["category"], r["description"], f"{r['amount']:.2f}", r["observations"]] for r in income_rows])
-    writer.writerows([[r["expense_date"], "Gasto", "Gasto", r["description"], f"{r['amount']:.2f}", r["observations"]] for r in expense_rows])
+    rows = [[r["income_date"], "Ingreso", r["category"].title(), r["description"], float(r["amount"]), r["observations"]] for r in income_rows]
+    rows += [[r["expense_date"], "Gasto", "Gasto", r["description"], float(r["amount"]), r["observations"]] for r in expense_rows]
     if category in ("todos", "reserva"):
-        for r in db().execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? ORDER BY reservation_date, id", (start, end)).fetchall(): writer.writerow([r["reservation_date"], "Reserva", "Reserva", r["concept"], f"{r['deposit']:.2f}", r["client_name"]])
-    return Response("\ufeff" + output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=reporte_{start}_{end}.csv"})
+        rows += [[r["reservation_date"], "Reserva", "Reserva", r["concept"], float(r["deposit"]), r["client_name"]] for r in db().execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? ORDER BY reservation_date, id", (start, end)).fetchall()]
+    workbook = excel_file(f"Reporte de movimientos — {start} al {end}", ["Fecha", "Tipo", "Área", "Descripción", "Monto", "Observaciones"], rows, currency_columns=(5,))
+    return send_file(workbook, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name=f"reporte_{start}_{end}.xlsx")
 
 
 @app.route("/cerrar-dia", methods=["POST"])
@@ -772,23 +819,32 @@ def close_day():
         return redirect(url_for("dashboard"))
     rows = connection.execute("SELECT * FROM incomes WHERE income_date = ? ORDER BY id", (closure_date,)).fetchall()
     expenses = connection.execute("SELECT * FROM expenses WHERE expense_date = ? ORDER BY id", (closure_date,)).fetchall()
-    for category, folder in (("taller", "taller"), ("renta", "rentas"), ("lavado", "lavados")):
+    for category, folder, label in (("taller", "taller", "Taller"), ("renta", "rentas", "Rentas"), ("lavado", "lavados", "Lavados")):
         path = EXPORT_DIR / folder; path.mkdir(parents=True, exist_ok=True)
-        with (path / f"{closure_date}.csv").open("w", newline="", encoding="utf-8-sig") as file:
-            writer = csv.writer(file); writer.writerow(["Fecha", "Descripción", "Monto", "Observaciones"])
-            for r in rows:
-                if r["category"] == category:
-                    writer.writerow([r["income_date"], r["description"], f"{r['amount']:.2f}", r["observations"]])
+        workbook = excel_file(
+            f"Cierre diario — {label} — {closure_date}",
+            ["Fecha", "Descripción", "Monto", "Observaciones"],
+            [[r["income_date"], r["description"], float(r["amount"]), r["observations"]] for r in rows if r["category"] == category],
+            currency_columns=(3,),
+        )
+        (path / f"{closure_date}.xlsx").write_bytes(workbook.getvalue())
     path = EXPORT_DIR / "gastos"; path.mkdir(parents=True, exist_ok=True)
-    with (path / f"{closure_date}.csv").open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file); writer.writerow(["Fecha", "Descripción", "Monto", "Observaciones"])
-        for expense in expenses:
-            writer.writerow([expense["expense_date"], expense["description"], f"{expense['amount']:.2f}", expense["observations"]])
+    workbook = excel_file(
+        f"Cierre diario — Gastos — {closure_date}",
+        ["Fecha", "Descripción", "Monto", "Observaciones"],
+        [[expense["expense_date"], expense["description"], float(expense["amount"]), expense["observations"]] for expense in expenses],
+        currency_columns=(3,),
+    )
+    (path / f"{closure_date}.xlsx").write_bytes(workbook.getvalue())
     reservations = connection.execute("SELECT * FROM vehicle_reservations WHERE reservation_date=? AND status='activa' ORDER BY id", (closure_date,)).fetchall()
     path = EXPORT_DIR / "reservas"; path.mkdir(parents=True, exist_ok=True)
-    with (path / f"{closure_date}.csv").open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file); writer.writerow(["Fecha", "Cliente", "Concepto", "Abono", "Saldo"])
-        for row in reservations: writer.writerow([row["reservation_date"], row["client_name"], row["concept"], f"{row['deposit']:.2f}", f"{row['remaining']:.2f}"])
+    workbook = excel_file(
+        f"Cierre diario — Reservas — {closure_date}",
+        ["Fecha", "Cliente", "Concepto", "Abono", "Saldo"],
+        [[row["reservation_date"], row["client_name"], row["concept"], float(row["deposit"]), float(row["remaining"])] for row in reservations],
+        currency_columns=(4, 5),
+    )
+    (path / f"{closure_date}.xlsx").write_bytes(workbook.getvalue())
     connection.execute("INSERT INTO day_closures (closure_date, closed_by) VALUES (?, ?)", (closure_date, session["user_id"]))
     audit("Cierres", "Cerró día", f"Cierre de caja del {closure_date}. Archivos generados: taller, rentas, lavados, reservas y gastos.")
     connection.commit()
