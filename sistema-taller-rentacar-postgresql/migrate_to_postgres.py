@@ -13,7 +13,7 @@ import psycopg
 BASE_DIR = Path(__file__).resolve().parent
 SOURCE_DB = Path(os.environ.get("SQLITE_SOURCE", BASE_DIR / "taller_rentacar.db"))
 TARGET_URL = os.environ.get("DATABASE_URL")
-TABLES = ("users", "employees", "incomes", "invoices", "expenses", "day_closures", "payroll_payments", "audit_logs")
+TABLES = ("users", "employees", "clients", "vehicles", "invoice_folders", "incomes", "invoices", "expenses", "vehicle_reservations", "day_closures", "payroll_payments", "audit_logs", "invoice_documents")
 
 
 def main():
