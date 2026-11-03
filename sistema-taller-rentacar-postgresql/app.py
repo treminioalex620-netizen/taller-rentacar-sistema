@@ -869,22 +869,41 @@ def create_invoice_folder():
     return redirect(url_for("invoices"))
 
 
-@app.route("/facturas/<int:invoice_id>/editar", methods=["POST"])
+@app.route("/facturas/<int:invoice_id>/editar", methods=["GET", "POST"])
 @login_required
 @admin_required
 def edit_invoice(invoice_id):
     record = db().execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
     if not record:
         flash("Factura no encontrada.", "warning"); return redirect(url_for("invoices"))
+    if request.method == "GET":
+        folders = db().execute("SELECT * FROM invoice_folders ORDER BY month_key DESC, name").fetchall()
+        return render_template("invoice_form.html", record=record, folders=folders)
     try:
         amount = float(request.form.get("amount", 0)); description = request.form.get("description", "").strip()
         assert description and amount > 0
         paid_date = parse_date(request.form.get("paid_date")).isoformat()
     except (ValueError, AssertionError):
-        flash("La factura necesita descripción, fecha y monto válido.", "danger"); return redirect(url_for("invoices"))
+        flash("La factura necesita descripción, fecha y monto válido.", "danger"); return redirect(url_for("edit_invoice", invoice_id=invoice_id))
     db().execute("UPDATE invoices SET description=?, amount=?, paid_date=?, notes=?, folder_id=? WHERE id=?", (description, amount, paid_date, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), invoice_id))
     audit("Facturas", "Editó factura", f"Factura #{invoice_id}: {description} — ${amount:.2f}")
     db().commit(); flash("Factura actualizada.", "success")
+    return redirect(url_for("invoices"))
+
+
+@app.route("/facturas/<int:invoice_id>/eliminar", methods=["POST"])
+@login_required
+@admin_required
+def delete_invoice(invoice_id):
+    record = db().execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    if not record:
+        flash("Factura no encontrada.", "warning")
+    else:
+        db().execute("DELETE FROM invoice_documents WHERE invoice_id=?", (invoice_id,))
+        db().execute("DELETE FROM invoices WHERE id=?", (invoice_id,))
+        audit("Facturas", "Eliminó factura", f"Factura #{invoice_id}: {record['description']} — ${record['amount']:.2f}")
+        db().commit()
+        flash("Factura eliminada definitivamente.", "success")
     return redirect(url_for("invoices"))
 
 
