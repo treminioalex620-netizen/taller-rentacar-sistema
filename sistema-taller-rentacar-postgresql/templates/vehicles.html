@@ -1,1 +1,22 @@
-{% extends 'base.html' %}{% block content %}<div class="page-heading"><p class="eyebrow">RENTACAR</p><h1>Vehículos</h1></div><div class="row g-4"><div class="col-lg-4"><form method="post" class="panel"><label>Placa</label><input required name="plate" class="form-control mb-2"><label>Marca</label><input required name="brand" class="form-control mb-2"><label>Modelo</label><input required name="model" class="form-control mb-2"><div class="row"><div class="col"><label>Año</label><input name="year" type="number" class="form-control mb-2"></div><div class="col"><label>Color</label><input name="color" class="form-control mb-2"></div></div><label>Precio diario</label><input name="daily_rate" type="number" step=".01" class="form-control mb-2"><label>Notas</label><textarea name="notes" class="form-control mb-3"></textarea><button class="btn btn-primary w-100">Guardar vehículo</button></form></div><div class="col-lg-8"><section class="panel"><div class="table-responsive"><table class="table"><thead><tr><th>Placa</th><th>Vehículo</th><th>Precio/día</th><th>Estado</th></tr></thead><tbody>{% for r in records %}<tr><td>{{r.plate}}</td><td>{{r.brand}} {{r.model}} {{r.year or ''}}</td><td>${{'%.2f'|format(r.daily_rate or 0)}}</td><td>{{r.status|title}}</td></tr>{% else %}<tr><td colspan="4">Sin vehículos.</td></tr>{% endfor %}</tbody></table></div></section></div></div>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading"><p class="eyebrow">RENTACAR</p><h1>Vehículos</h1></div>
+<div class="row g-4">
+  <div class="col-lg-4"><form method="post" class="panel">
+    <h2 class="h5 mb-3">Nuevo vehículo</h2>
+    <label>Placa</label><input required name="plate" class="form-control mb-2">
+    <label>Marca</label><input required name="brand" class="form-control mb-2">
+    <label>Modelo</label><input required name="model" class="form-control mb-2">
+    <div class="row"><div class="col"><label>Año</label><input name="year" type="number" class="form-control mb-2"></div><div class="col"><label>Color</label><input name="color" class="form-control mb-2"></div></div>
+    <label>Precio diario</label><input name="daily_rate" type="number" step=".01" min="0" class="form-control mb-2">
+    <label>Notas</label><textarea name="notes" class="form-control mb-3"></textarea>
+    <button class="btn btn-primary w-100">Guardar vehículo</button>
+  </form></div>
+  <div class="col-lg-8"><section class="panel"><div class="panel-title"><h2 class="h5 mb-0">Flota registrada</h2><span class="text-secondary">{{ records|length }} activos</span></div><div class="table-responsive">
+    <table class="table"><thead><tr><th>Placa</th><th>Vehículo</th><th>Precio/día</th><th>Estado</th><th class="text-end">Acciones</th></tr></thead><tbody>
+      {% for r in records %}<tr><td><strong>{{r.plate}}</strong></td><td>{{r.brand}} {{r.model}} {{r.year or ''}}<small class="d-block text-secondary">{{r.color or ''}}</small></td><td>${{'%.2f'|format(r.daily_rate or 0)}}</td><td><span class="badge text-bg-{{ 'success' if r.status=='disponible' else 'warning' if r.status=='reservado' else 'secondary' }}">{{r.status|title}}</span></td><td class="text-end text-nowrap"><a class="btn btn-sm btn-outline-primary" href="{{url_for('edit_vehicle',vehicle_id=r.id)}}">Editar</a><form method="post" action="{{url_for('delete_vehicle',vehicle_id=r.id)}}" class="d-inline" onsubmit="return confirm('¿Eliminar este vehículo?')"><button class="btn btn-sm btn-outline-danger">Eliminar</button></form></td></tr>
+      {% else %}<tr><td colspan="5">Sin vehículos.</td></tr>{% endfor %}
+    </tbody></table>
+  </div></section></div>
+</div>
+{% endblock %}

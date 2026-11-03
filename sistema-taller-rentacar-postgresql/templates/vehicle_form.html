@@ -1,0 +1,17 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading"><p class="eyebrow">RENTACAR</p><h1>Editar vehículo</h1></div>
+<form method="post" class="panel form-panel" style="max-width:850px">
+  <div class="row g-3">
+    <div class="col-md-4"><label>Placa</label><input required name="plate" value="{{record.plate}}" class="form-control"></div>
+    <div class="col-md-4"><label>Marca</label><input required name="brand" value="{{record.brand}}" class="form-control"></div>
+    <div class="col-md-4"><label>Modelo</label><input required name="model" value="{{record.model}}" class="form-control"></div>
+    <div class="col-md-3"><label>Año</label><input name="year" type="number" value="{{record.year or ''}}" class="form-control"></div>
+    <div class="col-md-3"><label>Color</label><input name="color" value="{{record.color or ''}}" class="form-control"></div>
+    <div class="col-md-3"><label>Precio diario</label><input name="daily_rate" type="number" min="0" step=".01" value="{{record.daily_rate or ''}}" class="form-control"></div>
+    <div class="col-md-3"><label>Estado</label><select name="status" class="form-select">{% for option,label in [('disponible','Disponible'),('reservado','Reservado'),('mantenimiento','Mantenimiento'),('inactivo','Inactivo')] %}<option value="{{option}}" {{'selected' if record.status==option}}>{{label}}</option>{% endfor %}</select></div>
+    <div class="col-12"><label>Notas</label><textarea name="notes" class="form-control">{{record.notes or ''}}</textarea></div>
+  </div>
+  <div class="mt-4 d-flex gap-2"><button class="btn btn-primary">Guardar cambios</button><a class="btn btn-light" href="{{url_for('vehicles')}}">Cancelar</a></div>
+</form>
+{% endblock %}

@@ -214,6 +214,14 @@ SQLITE_SCHEMA = """
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(created_by) REFERENCES users(id)
         );
+        CREATE TABLE IF NOT EXISTS report_folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            month_key TEXT NOT NULL UNIQUE,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(created_by) REFERENCES users(id)
+        );
         CREATE TABLE IF NOT EXISTS invoice_documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             invoice_id INTEGER NOT NULL,
@@ -555,6 +563,48 @@ def clients():
     return render_template("clients.html", records=db().execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall())
 
 
+@app.route("/clientes/<int:client_id>/editar", methods=["GET", "POST"])
+@login_required
+@admin_required
+def edit_client(client_id):
+    record = db().execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+    if not record:
+        flash("Cliente no encontrado.", "warning")
+        return redirect(url_for("clients"))
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        if not name:
+            flash("El nombre del cliente es obligatorio.", "danger")
+        else:
+            db().execute("UPDATE clients SET name=?, phone=?, document_id=?, address=?, notes=? WHERE id=?", (name, request.form.get("phone", "").strip(), request.form.get("document_id", "").strip(), request.form.get("address", "").strip(), request.form.get("notes", "").strip(), client_id))
+            audit("Clientes", "Editó cliente", f"Cliente #{client_id}: {name}")
+            db().commit()
+            flash("Cliente actualizado.", "success")
+            return redirect(url_for("clients"))
+        record = dict(record, name=name, phone=request.form.get("phone", "").strip(), document_id=request.form.get("document_id", "").strip(), address=request.form.get("address", "").strip(), notes=request.form.get("notes", "").strip())
+    return render_template("client_form.html", record=record)
+
+
+@app.route("/clientes/<int:client_id>/eliminar", methods=["POST"])
+@login_required
+@admin_required
+def delete_client(client_id):
+    record = db().execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+    if not record:
+        flash("Cliente no encontrado.", "warning")
+    elif db().execute("SELECT 1 FROM vehicle_reservations WHERE client_id = ? LIMIT 1", (client_id,)).fetchone():
+        db().execute("UPDATE clients SET active = 0 WHERE id = ?", (client_id,))
+        audit("Clientes", "Archivó cliente", f"Cliente #{client_id}: {record['name']} (con reservas)")
+        db().commit()
+        flash("Cliente archivado y retirado de las listas activas; se preservaron sus reservas históricas.", "success")
+    else:
+        db().execute("DELETE FROM clients WHERE id = ?", (client_id,))
+        audit("Clientes", "Eliminó cliente", f"Cliente #{client_id}: {record['name']}")
+        db().commit()
+        flash("Cliente eliminado.", "success")
+    return redirect(url_for("clients"))
+
+
 @app.route("/vehiculos", methods=["GET", "POST"])
 @login_required
 @admin_required
@@ -573,6 +623,58 @@ def vehicles():
             except Exception:
                 flash("Ya existe un vehículo con esa placa.", "danger")
     return render_template("vehicles.html", records=db().execute("SELECT * FROM vehicles WHERE active = 1 ORDER BY plate").fetchall())
+
+
+@app.route("/vehiculos/<int:vehicle_id>/editar", methods=["GET", "POST"])
+@login_required
+@admin_required
+def edit_vehicle(vehicle_id):
+    record = db().execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+    if not record:
+        flash("Vehículo no encontrado.", "warning")
+        return redirect(url_for("vehicles"))
+    if request.method == "POST":
+        plate = request.form.get("plate", "").strip().upper()
+        brand = request.form.get("brand", "").strip()
+        model = request.form.get("model", "").strip()
+        status = request.form.get("status", "disponible")
+        try:
+            daily_rate = float(request.form.get("daily_rate", 0) or 0)
+            assert plate and brand and model and daily_rate >= 0
+            assert status in ("disponible", "reservado", "mantenimiento", "inactivo")
+        except (ValueError, AssertionError):
+            flash("Complete placa, marca, modelo, estado y precio válidos.", "danger")
+        else:
+            try:
+                db().execute("UPDATE vehicles SET plate=?, brand=?, model=?, year=?, color=?, daily_rate=?, status=?, notes=? WHERE id=?", (plate, brand, model, request.form.get("year") or None, request.form.get("color", "").strip(), daily_rate or None, status, request.form.get("notes", "").strip(), vehicle_id))
+                audit("Vehículos", "Editó vehículo", f"Vehículo #{vehicle_id}: {plate} — {brand} {model}")
+                db().commit()
+                flash("Vehículo actualizado.", "success")
+                return redirect(url_for("vehicles"))
+            except Exception:
+                flash("Ya existe otro vehículo con esa placa.", "danger")
+        record = dict(record, plate=plate, brand=brand, model=model, year=request.form.get("year") or None, color=request.form.get("color", "").strip(), daily_rate=request.form.get("daily_rate", ""), status=status, notes=request.form.get("notes", "").strip())
+    return render_template("vehicle_form.html", record=record)
+
+
+@app.route("/vehiculos/<int:vehicle_id>/eliminar", methods=["POST"])
+@login_required
+@admin_required
+def delete_vehicle(vehicle_id):
+    record = db().execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+    if not record:
+        flash("Vehículo no encontrado.", "warning")
+    elif db().execute("SELECT 1 FROM vehicle_reservations WHERE vehicle_id = ? LIMIT 1", (vehicle_id,)).fetchone():
+        db().execute("UPDATE vehicles SET active = 0, status = 'inactivo' WHERE id = ?", (vehicle_id,))
+        audit("Vehículos", "Archivó vehículo", f"Vehículo #{vehicle_id}: {record['plate']} (con reservas)")
+        db().commit()
+        flash("Vehículo archivado y retirado de las listas activas; se preservaron sus reservas históricas.", "success")
+    else:
+        db().execute("DELETE FROM vehicles WHERE id = ?", (vehicle_id,))
+        audit("Vehículos", "Eliminó vehículo", f"Vehículo #{vehicle_id}: {record['plate']}")
+        db().commit()
+        flash("Vehículo eliminado.", "success")
+    return redirect(url_for("vehicles"))
 
 
 @app.route("/reservas", methods=["GET", "POST"])
@@ -787,7 +889,56 @@ def reports():
     records.sort(key=lambda row: (str(row["entry_date"]), row["id"]), reverse=True)
     totals = {"renta": 0, "taller": 0, "lavado": 0, "reserva": 0, "gasto": 0}
     for row in records: totals[row["category"]] += row["amount"]
-    return render_template("reports.html", records=records, start=start, end=end, category=category, totals=totals)
+    folders = db().execute("SELECT * FROM report_folders ORDER BY month_key DESC, name").fetchall()
+    return render_template("reports.html", records=records, start=start, end=end, category=category, totals=totals, folders=folders)
+
+
+@app.route("/reportes/carpetas", methods=["POST"])
+@login_required
+@admin_required
+def create_report_folder():
+    month_key = request.form.get("month_key", "").strip()
+    name = request.form.get("name", "").strip() or f"Reporte {month_key}"
+    try:
+        datetime.strptime(month_key, "%Y-%m")
+        db().execute("INSERT INTO report_folders (name, month_key, created_by) VALUES (?, ?, ?)", (name, month_key, session["user_id"]))
+        audit("Reportes", "Creó carpeta mensual", f"{name} ({month_key})")
+        db().commit()
+        flash("Carpeta mensual de reportes creada.", "success")
+    except Exception:
+        flash("No se pudo crear la carpeta; el mes y el nombre deben ser únicos.", "danger")
+    return redirect(url_for("reports"))
+
+
+@app.route("/reportes/carpetas/<int:folder_id>/zip")
+@login_required
+@admin_required
+def download_report_folder(folder_id):
+    folder = db().execute("SELECT * FROM report_folders WHERE id = ?", (folder_id,)).fetchone()
+    if not folder:
+        flash("Carpeta de reportes no encontrada.", "warning")
+        return redirect(url_for("reports"))
+    month_start = datetime.strptime(str(folder["month_key"]), "%Y-%m").date().replace(day=1)
+    next_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    month_end = next_month - timedelta(days=1)
+    start, end = month_start.isoformat(), month_end.isoformat()
+    connection = db()
+    incomes = connection.execute("SELECT * FROM incomes WHERE income_date BETWEEN ? AND ? ORDER BY income_date, id", (start, end)).fetchall()
+    expenses = connection.execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ? ORDER BY expense_date, id", (start, end)).fetchall()
+    reservations = connection.execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? ORDER BY reservation_date, id", (start, end)).fetchall()
+    files = {
+        "01_ingresos.xlsx": excel_file(f"Ingresos — {folder['name']}", ["Fecha", "Tipo", "Descripción", "Monto", "Observaciones"], [[row["income_date"], row["category"].title(), row["description"], float(row["amount"]), row["observations"]] for row in incomes], currency_columns=(4,)),
+        "02_gastos.xlsx": excel_file(f"Gastos — {folder['name']}", ["Fecha", "Categoría", "Descripción", "Monto", "Observaciones"], [[row["expense_date"], row["category"], row["description"], float(row["amount"]), row["observations"]] for row in expenses], currency_columns=(4,)),
+        "03_reservas.xlsx": excel_file(f"Reservas — {folder['name']}", ["Fecha", "Cliente", "Concepto", "Abono", "Saldo"], [[row["reservation_date"], row["client_name"], row["concept"], float(row["deposit"]), float(row["remaining"])] for row in reservations], currency_columns=(4, 5)),
+    }
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        for filename, workbook in files.items():
+            archive.writestr(filename, workbook.getvalue())
+    payload.seek(0)
+    audit("Reportes", "Descargó carpeta mensual", f"{folder['name']} ({start} al {end})")
+    connection.commit()
+    return send_file(payload, mimetype="application/zip", as_attachment=True, download_name=f"reportes_{secure_filename(folder['name']) or folder['month_key']}.zip")
 
 
 @app.route("/reportes/excel")

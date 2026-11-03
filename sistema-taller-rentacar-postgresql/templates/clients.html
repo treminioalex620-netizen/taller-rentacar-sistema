@@ -1,1 +1,21 @@
-{% extends 'base.html' %}{% block content %}<div class="page-heading"><p class="eyebrow">RENTACAR</p><h1>Clientes</h1></div><div class="row g-4"><div class="col-lg-4"><form method="post" class="panel"><label>Nombre</label><input required name="name" class="form-control mb-2"><label>Teléfono</label><input name="phone" class="form-control mb-2"><label>Documento</label><input name="document_id" class="form-control mb-2"><label>Dirección</label><input name="address" class="form-control mb-2"><label>Notas</label><textarea name="notes" class="form-control mb-3"></textarea><button class="btn btn-primary w-100">Guardar cliente</button></form></div><div class="col-lg-8"><section class="panel"><div class="table-responsive"><table class="table"><thead><tr><th>Cliente</th><th>Teléfono</th><th>Documento</th></tr></thead><tbody>{% for r in records %}<tr><td>{{r.name}}</td><td>{{r.phone or '—'}}</td><td>{{r.document_id or '—'}}</td></tr>{% else %}<tr><td colspan="3">Sin clientes.</td></tr>{% endfor %}</tbody></table></div></section></div></div>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading"><p class="eyebrow">RENTACAR</p><h1>Clientes</h1></div>
+<div class="row g-4">
+  <div class="col-lg-4"><form method="post" class="panel">
+    <h2 class="h5 mb-3">Nuevo cliente</h2>
+    <label>Nombre</label><input required name="name" class="form-control mb-2">
+    <label>Teléfono</label><input name="phone" class="form-control mb-2">
+    <label>Documento</label><input name="document_id" class="form-control mb-2">
+    <label>Dirección</label><input name="address" class="form-control mb-2">
+    <label>Notas</label><textarea name="notes" class="form-control mb-3"></textarea>
+    <button class="btn btn-primary w-100">Guardar cliente</button>
+  </form></div>
+  <div class="col-lg-8"><section class="panel"><div class="panel-title"><h2 class="h5 mb-0">Clientes registrados</h2><span class="text-secondary">{{ records|length }} activos</span></div><div class="table-responsive">
+    <table class="table"><thead><tr><th>Cliente</th><th>Teléfono</th><th>Documento</th><th class="text-end">Acciones</th></tr></thead><tbody>
+      {% for r in records %}<tr><td><strong>{{r.name}}</strong><small class="d-block text-secondary">{{r.address or ''}}</small></td><td>{{r.phone or '—'}}</td><td>{{r.document_id or '—'}}</td><td class="text-end text-nowrap"><a class="btn btn-sm btn-outline-primary" href="{{url_for('edit_client',client_id=r.id)}}">Editar</a><form method="post" action="{{url_for('delete_client',client_id=r.id)}}" class="d-inline" onsubmit="return confirm('¿Eliminar este cliente?')"><button class="btn btn-sm btn-outline-danger">Eliminar</button></form></td></tr>
+      {% else %}<tr><td colspan="4">Sin clientes.</td></tr>{% endfor %}
+    </tbody></table>
+  </div></section></div>
+</div>
+{% endblock %}

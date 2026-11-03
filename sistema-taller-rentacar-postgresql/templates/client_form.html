@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading"><p class="eyebrow">RENTACAR</p><h1>Editar cliente</h1></div>
+<form method="post" class="panel form-panel" style="max-width:760px">
+  <div class="row g-3">
+    <div class="col-md-6"><label>Nombre</label><input required name="name" value="{{record.name}}" class="form-control"></div>
+    <div class="col-md-6"><label>Teléfono</label><input name="phone" value="{{record.phone or ''}}" class="form-control"></div>
+    <div class="col-md-6"><label>Documento</label><input name="document_id" value="{{record.document_id or ''}}" class="form-control"></div>
+    <div class="col-md-6"><label>Dirección</label><input name="address" value="{{record.address or ''}}" class="form-control"></div>
+    <div class="col-12"><label>Notas</label><textarea name="notes" class="form-control">{{record.notes or ''}}</textarea></div>
+  </div>
+  <div class="mt-4 d-flex gap-2"><button class="btn btn-primary">Guardar cambios</button><a class="btn btn-light" href="{{url_for('clients')}}">Cancelar</a></div>
+</form>
+{% endblock %}
