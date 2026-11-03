@@ -923,8 +923,67 @@ def toggle_user(user_id):
         flash("No puede desactivar su propia cuenta mientras está conectado.", "warning")
     else:
         user = db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        db().execute("UPDATE users SET active = CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id = ?", (user_id,)); audit("Usuarios", "Cambió estado", f"Usuario {user['username'] if user else user_id}: {'desactivado' if user and user['active'] else 'activado'}"); db().commit()
-        flash("Estado del usuario actualizado.", "success")
+        active_admins = db().execute("SELECT COUNT(*) AS total FROM users WHERE role='admin' AND active=1").fetchone()["total"]
+        if user and user["role"] == "admin" and user["active"] and active_admins <= 1:
+            flash("No puede desactivar al último administrador activo.", "danger")
+        elif user:
+            db().execute("UPDATE users SET active = CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id = ?", (user_id,)); audit("Usuarios", "Cambió estado", f"Usuario {user['username']}: {'desactivado' if user['active'] else 'activado'}"); db().commit()
+            flash("Estado del usuario actualizado.", "success")
+        else:
+            flash("No se encontró el usuario.", "warning")
+    return redirect(url_for("users"))
+
+
+@app.route("/usuarios/<int:user_id>/editar", methods=["GET", "POST"])
+@login_required
+@admin_required
+def edit_user(user_id):
+    user = db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        flash("No se encontró el usuario.", "warning")
+        return redirect(url_for("users"))
+    if request.method == "POST":
+        username, role, password = request.form.get("username", "").strip(), request.form.get("role"), request.form.get("password", "")
+        active_admins = db().execute("SELECT COUNT(*) AS total FROM users WHERE role='admin' AND active=1").fetchone()["total"]
+        if not username or role not in ("admin", "user"):
+            flash("Ingrese un usuario y un rol válidos.", "danger")
+        elif password and len(password) < 6:
+            flash("La nueva contraseña debe tener al menos 6 caracteres.", "danger")
+        elif user["role"] == "admin" and user["active"] and role != "admin" and active_admins <= 1:
+            flash("No puede quitar el rol al último administrador activo.", "danger")
+        else:
+            try:
+                if password:
+                    db().execute("UPDATE users SET username=?, role=?, password_hash=? WHERE id=?", (username, role, generate_password_hash(password), user_id))
+                else:
+                    db().execute("UPDATE users SET username=?, role=? WHERE id=?", (username, role, user_id))
+                audit("Usuarios", "Editó usuario", f"Usuario #{user_id}: {user['username']} → {username}, rol {role}")
+                db().commit(); flash("Usuario actualizado.", "success")
+                return redirect(url_for("users"))
+            except Exception:
+                flash("Ese nombre de usuario ya existe.", "danger")
+    return render_template("user_form.html", record=user)
+
+
+@app.route("/usuarios/<int:user_id>/eliminar", methods=["POST"])
+@login_required
+@admin_required
+def delete_user(user_id):
+    user = db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        flash("No se encontró el usuario.", "warning")
+    elif user_id == session["user_id"]:
+        flash("No puede eliminar su propia cuenta mientras está conectado.", "warning")
+    elif user["role"] == "admin" and user["active"] and db().execute("SELECT COUNT(*) AS total FROM users WHERE role='admin' AND active=1").fetchone()["total"] <= 1:
+        flash("No puede eliminar al último administrador activo.", "danger")
+    else:
+        references = ("incomes", "expenses", "invoices", "day_closures", "payroll_payments", "audit_logs")
+        used_by = [table for table in references if db().execute(f"SELECT 1 FROM {table} WHERE {'closed_by' if table == 'day_closures' else 'actor_id' if table == 'audit_logs' else 'created_by'} = ? LIMIT 1", (user_id,)).fetchone()]
+        if used_by:
+            flash("No se puede eliminar porque tiene movimientos o bitácora asociados. Desactívelo para conservar el historial.", "warning")
+        else:
+            db().execute("DELETE FROM users WHERE id = ?", (user_id,)); audit("Usuarios", "Eliminó usuario", f"Usuario {user['username']}"); db().commit()
+            flash("Usuario eliminado.", "success")
     return redirect(url_for("users"))
 
 
