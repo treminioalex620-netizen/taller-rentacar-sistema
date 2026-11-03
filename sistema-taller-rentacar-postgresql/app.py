@@ -714,9 +714,10 @@ def download_invoice_folder(folder_id):
 def commissions():
     start, end = selected_range()
     connection = db()
-    workshop = connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE category = 'taller' AND income_date BETWEEN ? AND ?", (start, end)).fetchone()["total"]
-    invoices_total = connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM invoices WHERE status='pagada' AND paid_date BETWEEN ? AND ?", (start, end)).fetchone()["total"]
-    return render_template("commissions.html", start=start, end=end, workshop=workshop, invoices=invoices_total, base=workshop + invoices_total, commission=(workshop + invoices_total) * .01)
+    workshop = float(connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE category = 'taller' AND income_date BETWEEN ? AND ?", (start, end)).fetchone()["total"])
+    invoices_total = float(connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM invoices WHERE status='pagada' AND paid_date BETWEEN ? AND ?", (start, end)).fetchone()["total"])
+    base = workshop + invoices_total
+    return render_template("commissions.html", start=start, end=end, workshop=workshop, invoices=invoices_total, base=base, commission=base * 0.01)
 
 
 @app.route("/reportes")
