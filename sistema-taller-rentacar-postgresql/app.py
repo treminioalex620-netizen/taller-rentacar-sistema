@@ -200,10 +200,19 @@ SQLITE_SCHEMA = """
             remaining REAL NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'activa',
             notes TEXT,
+            folder_id INTEGER,
             created_by INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(client_id) REFERENCES clients(id),
             FOREIGN KEY(vehicle_id) REFERENCES vehicles(id),
+            FOREIGN KEY(created_by) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS reservation_folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            month_key TEXT NOT NULL UNIQUE,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(created_by) REFERENCES users(id)
         );
         CREATE TABLE IF NOT EXISTS invoice_folders (
@@ -333,7 +342,7 @@ def init_db():
             if column not in income_columns:
                 connection.execute(f"ALTER TABLE incomes ADD COLUMN {column} TEXT")
         reservation_columns = {row[1] for row in connection.execute("PRAGMA table_info(vehicle_reservations)")}
-        for column in ("start_date", "end_date"):
+        for column in ("start_date", "end_date", "folder_id"):
             if column not in reservation_columns:
                 connection.execute(f"ALTER TABLE vehicle_reservations ADD COLUMN {column} TEXT")
     else:
@@ -345,6 +354,7 @@ def init_db():
             "ALTER TABLE incomes ADD COLUMN IF NOT EXISTS rental_end DATE",
             "ALTER TABLE vehicle_reservations ADD COLUMN IF NOT EXISTS start_date DATE",
             "ALTER TABLE vehicle_reservations ADD COLUMN IF NOT EXISTS end_date DATE",
+            "ALTER TABLE vehicle_reservations ADD COLUMN IF NOT EXISTS folder_id BIGINT",
             "ALTER TABLE incomes DROP CONSTRAINT IF EXISTS incomes_category_check",
             "ALTER TABLE incomes ADD CONSTRAINT incomes_category_check CHECK (category IN ('renta', 'taller', 'lavado'))",
         ):
@@ -700,12 +710,65 @@ def reservations():
             flash("No puede registrar una reserva en un día cerrado.", "danger")
         elif valid:
             remaining = total - deposit
-            connection.execute("INSERT INTO vehicle_reservations (reservation_date, start_date, end_date, client_id, client_name, phone, vehicle_id, concept, total_amount, deposit, days_total, remaining, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (reservation_date, start_date, end_date, client_id, client["name"], request.form.get("phone", client["phone"] or "").strip(), vehicle_id, request.form.get("concept").strip(), total, deposit, days_total, remaining, request.form.get("notes", "").strip(), session["user_id"]))
+            connection.execute("INSERT INTO vehicle_reservations (reservation_date, start_date, end_date, client_id, client_name, phone, vehicle_id, concept, total_amount, deposit, days_total, remaining, notes, folder_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (reservation_date, start_date, end_date, client_id, client["name"], request.form.get("phone", client["phone"] or "").strip(), vehicle_id, request.form.get("concept").strip(), total, deposit, days_total, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), session["user_id"]))
             if vehicle_id: connection.execute("UPDATE vehicles SET status = 'reservado' WHERE id = ?", (vehicle_id,))
             audit("Reservas", "Registró reserva", f"{client['name']}: abono ${deposit:.2f}, saldo ${remaining:.2f} ({reservation_date})"); connection.commit()
             flash("Reserva y abono registrados.", "success"); return redirect(url_for("reservations"))
     records = connection.execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id = vehicle_reservations.vehicle_id ORDER BY reservation_date DESC, id DESC LIMIT 100").fetchall()
-    return render_template("reservations.html", records=records, clients=connection.execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active = 1 AND status IN ('disponible','reservado') ORDER BY plate").fetchall())
+    return render_template("reservations.html", records=records, clients=connection.execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active = 1 AND status IN ('disponible','reservado') ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
+
+
+@app.route("/reservas/<int:reservation_id>/editar", methods=["GET", "POST"])
+@login_required
+def edit_reservation(reservation_id):
+    connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=?", (reservation_id,)).fetchone()
+    if not record: flash("Reserva no encontrada.", "warning"); return redirect(url_for("reservations"))
+    if request.method == "POST":
+        try:
+            total, deposit, days = float(request.form.get("total_amount", 0)), float(request.form.get("deposit", 0)), int(request.form.get("days_total", 0)); client_id = request.form.get("client_id", type=int); vehicle_id = request.form.get("vehicle_id", type=int); client = connection.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone(); start, end = request.form.get("start_date"), request.form.get("end_date"); assert client and total >= 0 and 0 <= deposit <= total and days > 0 and start and end and parse_date(start) <= parse_date(end)
+        except (ValueError, AssertionError): flash("Revise cliente, fechas, días y montos.", "danger")
+        else:
+            old_vehicle = record["vehicle_id"]; remaining = total - deposit
+            connection.execute("UPDATE vehicle_reservations SET reservation_date=?, start_date=?, end_date=?, client_id=?, client_name=?, phone=?, vehicle_id=?, concept=?, total_amount=?, deposit=?, days_total=?, remaining=?, notes=?, folder_id=? WHERE id=?", (parse_date(request.form.get("reservation_date")).isoformat(), start, end, client_id, client["name"], request.form.get("phone", "").strip(), vehicle_id, request.form.get("concept", "").strip(), total, deposit, days, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), reservation_id))
+            if old_vehicle and old_vehicle != vehicle_id: connection.execute("UPDATE vehicles SET status='disponible' WHERE id=?", (old_vehicle,))
+            if vehicle_id: connection.execute("UPDATE vehicles SET status='reservado' WHERE id=?", (vehicle_id,))
+            audit("Reservas", "Editó reserva", f"Reserva #{reservation_id}: {client['name']} — abono ${deposit:.2f}"); connection.commit(); flash("Reserva actualizada.", "success"); return redirect(url_for("reservations"))
+    return render_template("reservation_form.html", record=record, clients=connection.execute("SELECT * FROM clients WHERE active=1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active=1 ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
+
+
+@app.route("/reservas/<int:reservation_id>/eliminar", methods=["POST"])
+@login_required
+def delete_reservation(reservation_id):
+    connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=?", (reservation_id,)).fetchone()
+    if record:
+        connection.execute("DELETE FROM vehicle_reservations WHERE id=?", (reservation_id,))
+        if record["vehicle_id"]: connection.execute("UPDATE vehicles SET status='disponible' WHERE id=?", (record["vehicle_id"],))
+        audit("Reservas", "Eliminó reserva", f"Reserva #{reservation_id}: {record['client_name']}"); connection.commit(); flash("Reserva eliminada.", "success")
+    return redirect(url_for("reservations"))
+
+
+@app.route("/reservas/carpetas", methods=["POST"])
+@login_required
+@admin_required
+def create_reservation_folder():
+    month_key = request.form.get("month_key", "").strip(); name = request.form.get("name", "").strip() or f"Reservas {month_key}"
+    try:
+        datetime.strptime(month_key, "%Y-%m"); db().execute("INSERT INTO reservation_folders (name, month_key, created_by) VALUES (?, ?, ?)", (name, month_key, session["user_id"])); audit("Reservas", "Creó carpeta", f"{name} ({month_key})"); db().commit(); flash("Carpeta de reservas creada.", "success")
+    except Exception: flash("No se pudo crear la carpeta; el mes y el nombre deben ser únicos.", "danger")
+    return redirect(url_for("reservations"))
+
+
+@app.route("/reservas/carpetas/<int:folder_id>/zip")
+@login_required
+def download_reservation_folder(folder_id):
+    folder = db().execute("SELECT * FROM reservation_folders WHERE id=?", (folder_id,)).fetchone()
+    if not folder: flash("Carpeta no encontrada.", "warning"); return redirect(url_for("reservations"))
+    records = db().execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id=vehicle_reservations.vehicle_id WHERE folder_id=? ORDER BY reservation_date, id", (folder_id,)).fetchall()
+    workbook = excel_file(f"Reservas — {folder['name']}", ["Registro", "Desde", "Hasta", "Cliente", "Vehículo", "Total", "Abono", "Saldo", "Concepto"], [[r["reservation_date"], r["start_date"], r["end_date"], r["client_name"], r["plate"] or "", float(r["total_amount"]), float(r["deposit"]), float(r["remaining"]), r["concept"]] for r in records], currency_columns=(6, 7, 8))
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive: archive.writestr(f"{secure_filename(folder['name']) or 'reservas'}.xlsx", workbook.getvalue())
+    payload.seek(0); audit("Reservas", "Descargó carpeta", folder["name"]); db().commit()
+    return send_file(payload, mimetype="application/zip", as_attachment=True, download_name=f"reservas_{secure_filename(folder['name'])}.zip")
 
 
 @app.route("/gastos/nuevo", methods=["GET", "POST"])
