@@ -361,6 +361,7 @@ def init_db():
             "ALTER TABLE incomes ADD CONSTRAINT incomes_category_check CHECK (category IN ('renta', 'taller', 'lavado'))",
         ):
             connection.execute(statement)
+    connection.execute("UPDATE vehicle_reservations SET rental_state = CASE WHEN total_amount > 0 AND remaining <= 0 THEN 'rentado' ELSE 'reservado' END WHERE rental_state IS NULL OR rental_state NOT IN ('reservado', 'rentado')")
     exists = connection.execute("SELECT 1 FROM users WHERE username = 'admin'").fetchone()
     if not exists:
         connection.execute(
@@ -437,17 +438,29 @@ def refresh_vehicle_availability():
     for vehicle in vehicles:
         booking = connection.execute("""
             SELECT rental_state FROM vehicle_reservations
-            WHERE vehicle_id = ? AND status = 'activa' AND COALESCE(end_date, reservation_date) >= ?
+            WHERE vehicle_id = ? AND status = 'activa' AND COALESCE(end_date, reservation_date) > ?
             ORDER BY COALESCE(end_date, reservation_date) DESC, id DESC LIMIT 1
         """, (vehicle["id"], today)).fetchone()
         desired_status = booking["rental_state"] if booking else "disponible"
-        if desired_status not in ("reservado", "rentado"):
+        if booking and desired_status not in ("reservado", "rentado"):
             desired_status = "reservado"
         if vehicle["status"] != desired_status:
             connection.execute("UPDATE vehicles SET status = ? WHERE id = ?", (desired_status, vehicle["id"]))
             changed = True
     if changed:
         connection.commit()
+
+
+def vehicle_is_unavailable(vehicle_id: int | None, exclude_reservation_id: int | None = None) -> bool:
+    """A vehicle with an active future reservation/rental cannot be assigned twice."""
+    if not vehicle_id:
+        return False
+    query = "SELECT 1 FROM vehicle_reservations WHERE vehicle_id = ? AND status = 'activa' AND COALESCE(end_date, reservation_date) > ?"
+    params = [vehicle_id, date.today().isoformat()]
+    if exclude_reservation_id:
+        query += " AND id != ?"
+        params.append(exclude_reservation_id)
+    return bool(db().execute(query + " LIMIT 1", params).fetchone())
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -742,6 +755,8 @@ def reservations():
             valid = False
         if valid and is_closed(reservation_date):
             flash("No puede registrar una reserva en un día cerrado.", "danger")
+        elif valid and vehicle_is_unavailable(vehicle_id):
+            flash("Ese vehículo ya está reservado o rentado; no se puede asignar otra reserva hasta que quede disponible.", "danger")
         elif valid:
             remaining = total - deposit
             rental_state = "rentado" if total > 0 and remaining <= 0 else "reservado"
@@ -750,7 +765,7 @@ def reservations():
             audit("Reservas", "Registró reserva", f"{client['name']}: abono ${deposit:.2f}, saldo ${remaining:.2f}, estado {rental_state} ({reservation_date})"); connection.commit()
             flash("Reserva y abono registrados.", "success"); return redirect(url_for("reservations"))
     records = connection.execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id = vehicle_reservations.vehicle_id ORDER BY reservation_date DESC, id DESC LIMIT 100").fetchall()
-    return render_template("reservations.html", records=records, clients=connection.execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active = 1 AND status IN ('disponible','reservado') ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
+    return render_template("reservations.html", records=records, clients=connection.execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active = 1 AND status = 'disponible' ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
 
 
 @app.route("/reservas/<int:reservation_id>/editar", methods=["GET", "POST"])
@@ -761,16 +776,20 @@ def edit_reservation(reservation_id):
     if request.method == "POST":
         try:
             total, deposit, days = float(request.form.get("total_amount", 0)), float(request.form.get("deposit", 0)), int(request.form.get("days_total", 0)); client_id = request.form.get("client_id", type=int); vehicle_id = request.form.get("vehicle_id", type=int); client = connection.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone(); start, end = request.form.get("start_date"), request.form.get("end_date"); assert client and total >= 0 and 0 <= deposit <= total and days > 0 and start and end and parse_date(start) <= parse_date(end)
-        except (ValueError, AssertionError): flash("Revise cliente, fechas, días y montos.", "danger")
+        except (ValueError, AssertionError):
+            flash("Revise cliente, fechas, días y montos.", "danger")
         else:
-            old_vehicle = record["vehicle_id"]; remaining = total - deposit
-            rental_state = "rentado" if total > 0 and remaining <= 0 else "reservado"
-            connection.execute("UPDATE vehicle_reservations SET reservation_date=?, start_date=?, end_date=?, client_id=?, client_name=?, phone=?, vehicle_id=?, concept=?, total_amount=?, deposit=?, days_total=?, remaining=?, notes=?, folder_id=?, rental_state=? WHERE id=?", (parse_date(request.form.get("reservation_date")).isoformat(), start, end, client_id, client["name"], request.form.get("phone", "").strip(), vehicle_id, request.form.get("concept", "").strip(), total, deposit, days, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), rental_state, reservation_id))
-            if vehicle_id: connection.execute("UPDATE vehicles SET status=? WHERE id=?", (rental_state, vehicle_id))
-            audit("Reservas", "Editó reserva", f"Reserva #{reservation_id}: {client['name']} — abono ${deposit:.2f}, saldo ${remaining:.2f}, estado {rental_state}"); connection.commit()
-            if old_vehicle and old_vehicle != vehicle_id: refresh_vehicle_availability()
-            flash("Reserva actualizada. Al completar el saldo, el vehículo quedó marcado como rentado.", "success"); return redirect(url_for("reservations"))
-    return render_template("reservation_form.html", record=record, clients=connection.execute("SELECT * FROM clients WHERE active=1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active=1 ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
+            if vehicle_is_unavailable(vehicle_id, reservation_id):
+                flash("Ese vehículo ya está reservado o rentado; elija uno disponible.", "danger")
+            else:
+                old_vehicle = record["vehicle_id"]; remaining = total - deposit
+                rental_state = "rentado" if total > 0 and remaining <= 0 else "reservado"
+                connection.execute("UPDATE vehicle_reservations SET reservation_date=?, start_date=?, end_date=?, client_id=?, client_name=?, phone=?, vehicle_id=?, concept=?, total_amount=?, deposit=?, days_total=?, remaining=?, notes=?, folder_id=?, rental_state=? WHERE id=?", (parse_date(request.form.get("reservation_date")).isoformat(), start, end, client_id, client["name"], request.form.get("phone", "").strip(), vehicle_id, request.form.get("concept", "").strip(), total, deposit, days, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), rental_state, reservation_id))
+                if vehicle_id: connection.execute("UPDATE vehicles SET status=? WHERE id=?", (rental_state, vehicle_id))
+                audit("Reservas", "Editó reserva", f"Reserva #{reservation_id}: {client['name']} — abono ${deposit:.2f}, saldo ${remaining:.2f}, estado {rental_state}"); connection.commit()
+                if old_vehicle and old_vehicle != vehicle_id: refresh_vehicle_availability()
+                flash("Reserva actualizada. Al completar el saldo, el vehículo quedó marcado como rentado.", "success"); return redirect(url_for("reservations"))
+    return render_template("reservation_form.html", record=record, clients=connection.execute("SELECT * FROM clients WHERE active=1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active=1 AND (status='disponible' OR id=?) ORDER BY plate", (record["vehicle_id"],)).fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
 
 
 @app.route("/reservas/<int:reservation_id>/eliminar", methods=["POST"])
