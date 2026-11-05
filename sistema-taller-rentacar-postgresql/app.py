@@ -199,6 +199,7 @@ SQLITE_SCHEMA = """
             days_total INTEGER NOT NULL DEFAULT 1,
             remaining REAL NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'activa',
+            rental_state TEXT NOT NULL DEFAULT 'reservado',
             notes TEXT,
             folder_id INTEGER,
             created_by INTEGER NOT NULL,
@@ -342,7 +343,7 @@ def init_db():
             if column not in income_columns:
                 connection.execute(f"ALTER TABLE incomes ADD COLUMN {column} TEXT")
         reservation_columns = {row[1] for row in connection.execute("PRAGMA table_info(vehicle_reservations)")}
-        for column in ("start_date", "end_date", "folder_id"):
+        for column in ("start_date", "end_date", "folder_id", "rental_state"):
             if column not in reservation_columns:
                 connection.execute(f"ALTER TABLE vehicle_reservations ADD COLUMN {column} TEXT")
     else:
@@ -355,6 +356,7 @@ def init_db():
             "ALTER TABLE vehicle_reservations ADD COLUMN IF NOT EXISTS start_date DATE",
             "ALTER TABLE vehicle_reservations ADD COLUMN IF NOT EXISTS end_date DATE",
             "ALTER TABLE vehicle_reservations ADD COLUMN IF NOT EXISTS folder_id BIGINT",
+            "ALTER TABLE vehicle_reservations ADD COLUMN IF NOT EXISTS rental_state TEXT NOT NULL DEFAULT 'reservado'",
             "ALTER TABLE incomes DROP CONSTRAINT IF EXISTS incomes_category_check",
             "ALTER TABLE incomes ADD CONSTRAINT incomes_category_check CHECK (category IN ('renta', 'taller', 'lavado'))",
         ):
@@ -426,6 +428,28 @@ def audit(module: str, action: str, detail: str):
         db().execute("INSERT INTO audit_logs (actor_id, module, action, detail) VALUES (?, ?, ?, ?)", (actor_id, module, action, detail))
 
 
+def refresh_vehicle_availability():
+    """Updates vehicle availability from active reservations and their return dates."""
+    connection = db()
+    today = date.today().isoformat()
+    vehicles = connection.execute("SELECT id, status FROM vehicles WHERE active = 1 AND status IN ('disponible', 'reservado', 'rentado')").fetchall()
+    changed = False
+    for vehicle in vehicles:
+        booking = connection.execute("""
+            SELECT rental_state FROM vehicle_reservations
+            WHERE vehicle_id = ? AND status = 'activa' AND COALESCE(end_date, reservation_date) >= ?
+            ORDER BY COALESCE(end_date, reservation_date) DESC, id DESC LIMIT 1
+        """, (vehicle["id"], today)).fetchone()
+        desired_status = booking["rental_state"] if booking else "disponible"
+        if desired_status not in ("reservado", "rentado"):
+            desired_status = "reservado"
+        if vehicle["status"] != desired_status:
+            connection.execute("UPDATE vehicles SET status = ? WHERE id = ?", (desired_status, vehicle["id"]))
+            changed = True
+    if changed:
+        connection.commit()
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if session.get("user_id"):
@@ -449,7 +473,15 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
+    refresh_vehicle_availability()
     today = date.today().isoformat()
+    return_tomorrow = db().execute("""
+        SELECT vehicle_reservations.*, vehicles.plate, vehicles.brand, vehicles.model
+        FROM vehicle_reservations
+        LEFT JOIN vehicles ON vehicles.id = vehicle_reservations.vehicle_id
+        WHERE vehicle_reservations.status = 'activa' AND vehicle_reservations.end_date = ?
+        ORDER BY vehicle_reservations.end_date, vehicle_reservations.id
+    """, ((date.today() + timedelta(days=1)).isoformat(),)).fetchall()
     day_is_closed = is_closed(today)
     totals = db().execute("""
         SELECT category, COALESCE(SUM(amount), 0) total FROM incomes
@@ -465,7 +497,7 @@ def dashboard():
     if day_is_closed:
         data, expenses_total, reservations_total, recent = {}, 0, 0, []
     income_total = data.get("renta", 0) + data.get("taller", 0) + data.get("lavado", 0) + reservations_total
-    return render_template("dashboard.html", rental_total=data.get("renta", 0), workshop_total=data.get("taller", 0), wash_total=data.get("lavado", 0), reservations_total=reservations_total, expenses_total=expenses_total, income_total=income_total, net_total=income_total - expenses_total, recent=recent[:8], today=today, day_is_closed=day_is_closed)
+    return render_template("dashboard.html", rental_total=data.get("renta", 0), workshop_total=data.get("taller", 0), wash_total=data.get("lavado", 0), reservations_total=reservations_total, expenses_total=expenses_total, income_total=income_total, net_total=income_total - expenses_total, recent=recent[:8], today=today, day_is_closed=day_is_closed, return_tomorrow=return_tomorrow)
 
 
 @app.route("/ingresos/nuevo", methods=["GET", "POST"])
@@ -632,6 +664,7 @@ def vehicles():
                 audit("Vehículos", "Registró vehículo", f"{plate} — {brand} {model}"); db().commit(); flash("Vehículo agregado.", "success")
             except Exception:
                 flash("Ya existe un vehículo con esa placa.", "danger")
+    refresh_vehicle_availability()
     return render_template("vehicles.html", records=db().execute("SELECT * FROM vehicles WHERE active = 1 ORDER BY plate").fetchall())
 
 
@@ -651,7 +684,7 @@ def edit_vehicle(vehicle_id):
         try:
             daily_rate = float(request.form.get("daily_rate", 0) or 0)
             assert plate and brand and model and daily_rate >= 0
-            assert status in ("disponible", "reservado", "mantenimiento", "inactivo")
+            assert status in ("disponible", "reservado", "rentado", "mantenimiento", "inactivo")
         except (ValueError, AssertionError):
             flash("Complete placa, marca, modelo, estado y precio válidos.", "danger")
         else:
@@ -691,6 +724,7 @@ def delete_vehicle(vehicle_id):
 @login_required
 def reservations():
     connection = db()
+    refresh_vehicle_availability()
     if request.method == "POST":
         reservation_date = parse_date(request.form.get("reservation_date")).isoformat()
         start_date = request.form.get("start_date", "").strip()
@@ -710,9 +744,10 @@ def reservations():
             flash("No puede registrar una reserva en un día cerrado.", "danger")
         elif valid:
             remaining = total - deposit
-            connection.execute("INSERT INTO vehicle_reservations (reservation_date, start_date, end_date, client_id, client_name, phone, vehicle_id, concept, total_amount, deposit, days_total, remaining, notes, folder_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (reservation_date, start_date, end_date, client_id, client["name"], request.form.get("phone", client["phone"] or "").strip(), vehicle_id, request.form.get("concept").strip(), total, deposit, days_total, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), session["user_id"]))
-            if vehicle_id: connection.execute("UPDATE vehicles SET status = 'reservado' WHERE id = ?", (vehicle_id,))
-            audit("Reservas", "Registró reserva", f"{client['name']}: abono ${deposit:.2f}, saldo ${remaining:.2f} ({reservation_date})"); connection.commit()
+            rental_state = "rentado" if total > 0 and remaining <= 0 else "reservado"
+            connection.execute("INSERT INTO vehicle_reservations (reservation_date, start_date, end_date, client_id, client_name, phone, vehicle_id, concept, total_amount, deposit, days_total, remaining, notes, folder_id, rental_state, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (reservation_date, start_date, end_date, client_id, client["name"], request.form.get("phone", client["phone"] or "").strip(), vehicle_id, request.form.get("concept").strip(), total, deposit, days_total, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), rental_state, session["user_id"]))
+            if vehicle_id: connection.execute("UPDATE vehicles SET status = ? WHERE id = ?", (rental_state, vehicle_id))
+            audit("Reservas", "Registró reserva", f"{client['name']}: abono ${deposit:.2f}, saldo ${remaining:.2f}, estado {rental_state} ({reservation_date})"); connection.commit()
             flash("Reserva y abono registrados.", "success"); return redirect(url_for("reservations"))
     records = connection.execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id = vehicle_reservations.vehicle_id ORDER BY reservation_date DESC, id DESC LIMIT 100").fetchall()
     return render_template("reservations.html", records=records, clients=connection.execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active = 1 AND status IN ('disponible','reservado') ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
@@ -729,10 +764,12 @@ def edit_reservation(reservation_id):
         except (ValueError, AssertionError): flash("Revise cliente, fechas, días y montos.", "danger")
         else:
             old_vehicle = record["vehicle_id"]; remaining = total - deposit
-            connection.execute("UPDATE vehicle_reservations SET reservation_date=?, start_date=?, end_date=?, client_id=?, client_name=?, phone=?, vehicle_id=?, concept=?, total_amount=?, deposit=?, days_total=?, remaining=?, notes=?, folder_id=? WHERE id=?", (parse_date(request.form.get("reservation_date")).isoformat(), start, end, client_id, client["name"], request.form.get("phone", "").strip(), vehicle_id, request.form.get("concept", "").strip(), total, deposit, days, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), reservation_id))
-            if old_vehicle and old_vehicle != vehicle_id: connection.execute("UPDATE vehicles SET status='disponible' WHERE id=?", (old_vehicle,))
-            if vehicle_id: connection.execute("UPDATE vehicles SET status='reservado' WHERE id=?", (vehicle_id,))
-            audit("Reservas", "Editó reserva", f"Reserva #{reservation_id}: {client['name']} — abono ${deposit:.2f}"); connection.commit(); flash("Reserva actualizada.", "success"); return redirect(url_for("reservations"))
+            rental_state = "rentado" if total > 0 and remaining <= 0 else "reservado"
+            connection.execute("UPDATE vehicle_reservations SET reservation_date=?, start_date=?, end_date=?, client_id=?, client_name=?, phone=?, vehicle_id=?, concept=?, total_amount=?, deposit=?, days_total=?, remaining=?, notes=?, folder_id=?, rental_state=? WHERE id=?", (parse_date(request.form.get("reservation_date")).isoformat(), start, end, client_id, client["name"], request.form.get("phone", "").strip(), vehicle_id, request.form.get("concept", "").strip(), total, deposit, days, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), rental_state, reservation_id))
+            if vehicle_id: connection.execute("UPDATE vehicles SET status=? WHERE id=?", (rental_state, vehicle_id))
+            audit("Reservas", "Editó reserva", f"Reserva #{reservation_id}: {client['name']} — abono ${deposit:.2f}, saldo ${remaining:.2f}, estado {rental_state}"); connection.commit()
+            if old_vehicle and old_vehicle != vehicle_id: refresh_vehicle_availability()
+            flash("Reserva actualizada. Al completar el saldo, el vehículo quedó marcado como rentado.", "success"); return redirect(url_for("reservations"))
     return render_template("reservation_form.html", record=record, clients=connection.execute("SELECT * FROM clients WHERE active=1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active=1 ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
 
 
@@ -742,8 +779,9 @@ def delete_reservation(reservation_id):
     connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=?", (reservation_id,)).fetchone()
     if record:
         connection.execute("DELETE FROM vehicle_reservations WHERE id=?", (reservation_id,))
-        if record["vehicle_id"]: connection.execute("UPDATE vehicles SET status='disponible' WHERE id=?", (record["vehicle_id"],))
-        audit("Reservas", "Eliminó reserva", f"Reserva #{reservation_id}: {record['client_name']}"); connection.commit(); flash("Reserva eliminada.", "success")
+        audit("Reservas", "Eliminó reserva", f"Reserva #{reservation_id}: {record['client_name']}"); connection.commit()
+        refresh_vehicle_availability()
+        flash("Reserva eliminada.", "success")
     return redirect(url_for("reservations"))
 
 
