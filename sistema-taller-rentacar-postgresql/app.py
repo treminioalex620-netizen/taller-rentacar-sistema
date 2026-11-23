@@ -110,12 +110,19 @@ def close_db(_error=None):
 
 
 SQLITE_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS branches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL CHECK(role IN ('admin', 'user')),
             active INTEGER NOT NULL DEFAULT 1,
+            branch_id INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS incomes (
@@ -315,6 +322,19 @@ def init_db():
     columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")} if not USING_POSTGRES else {"active"}
     if "active" not in columns:
         connection.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    # Multi-sucursal migration. It is deliberately additive: existing records are
+    # assigned to the principal branch instead of being recreated or deleted.
+    if USING_POSTGRES:
+        connection.execute("CREATE TABLE IF NOT EXISTS branches (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        for table in ("users", "incomes", "invoices", "expenses", "day_closures", "clients", "vehicles", "vehicle_reservations", "reservation_folders", "invoice_folders", "report_folders", "employees", "audit_logs", "payroll_payments"):
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS branch_id BIGINT")
+    else:
+        connection.execute("CREATE TABLE IF NOT EXISTS branches (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        tables = ("users", "incomes", "invoices", "expenses", "day_closures", "clients", "vehicles", "vehicle_reservations", "reservation_folders", "invoice_folders", "report_folders", "employees", "audit_logs", "payroll_payments")
+        for table in tables:
+            table_columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if "branch_id" not in table_columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN branch_id INTEGER")
     if not USING_POSTGRES:
         payroll_columns = {row[1] for row in connection.execute("PRAGMA table_info(payroll_payments)")}
         for column, definition in (("employee_id", "INTEGER"), ("daily_rate", "REAL NOT NULL DEFAULT 0"), ("days_worked", "INTEGER NOT NULL DEFAULT 0"), ("days_absent", "INTEGER NOT NULL DEFAULT 0"), ("base_salary", "REAL NOT NULL DEFAULT 0"), ("commission_eligible", "INTEGER NOT NULL DEFAULT 0"), ("commission_amount", "REAL NOT NULL DEFAULT 0")):
@@ -362,11 +382,19 @@ def init_db():
         ):
             connection.execute(statement)
     connection.execute("UPDATE vehicle_reservations SET rental_state = CASE WHEN total_amount > 0 AND remaining <= 0 THEN 'rentado' ELSE 'reservado' END WHERE rental_state IS NULL OR rental_state NOT IN ('reservado', 'rentado')")
+    principal = connection.execute("SELECT id FROM branches WHERE name = ?", ("Sucursal principal",)).fetchone()
+    if not principal:
+        connection.execute("INSERT INTO branches (name) VALUES (?)", ("Sucursal principal",))
+        principal = connection.execute("SELECT id FROM branches WHERE name = ?", ("Sucursal principal",)).fetchone()
+    connection.execute("INSERT INTO branches (name) SELECT ? WHERE NOT EXISTS (SELECT 1 FROM branches WHERE name = ?)", ("Sucursal 2", "Sucursal 2"))
+    principal_id = principal["id"]
+    for table in ("users", "incomes", "invoices", "expenses", "day_closures", "clients", "vehicles", "vehicle_reservations", "reservation_folders", "invoice_folders", "report_folders", "employees", "audit_logs", "payroll_payments"):
+        connection.execute(f"UPDATE {table} SET branch_id = ? WHERE branch_id IS NULL", (principal_id,))
     exists = connection.execute("SELECT 1 FROM users WHERE username = 'admin'").fetchone()
     if not exists:
         connection.execute(
-            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')",
-            ("admin", generate_password_hash("admin123")),
+            "INSERT INTO users (username, password_hash, role, branch_id) VALUES (?, ?, 'admin', ?)",
+            ("admin", generate_password_hash("admin123"), principal_id),
         )
     connection.commit()
     connection.close()
@@ -407,15 +435,32 @@ def selected_range():
     return start.isoformat(), end.isoformat()
 
 
+def current_branch_id() -> int:
+    """The active branch is stored in the session; normal users cannot switch it."""
+    return int(session.get("branch_id", 1))
+
+
+def belongs_to_current_branch(record) -> bool:
+    return bool(record) and record["branch_id"] == current_branch_id()
+
+
+@app.context_processor
+def inject_branch_context():
+    if not session.get("user_id"):
+        return {}
+    branches = db().execute("SELECT * FROM branches WHERE active=1 ORDER BY name").fetchall()
+    return {"branches": branches, "current_branch_id": current_branch_id(), "current_branch_name": next((branch["name"] for branch in branches if branch["id"] == current_branch_id()), "Sucursal")}
+
+
 def commission_for_period(start: str, end: str) -> float:
     connection = db()
-    workshop = connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE category = 'taller' AND income_date BETWEEN ? AND ?", (start, end)).fetchone()["total"]
-    invoices_total = connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM invoices WHERE status = 'pagada' AND paid_date BETWEEN ? AND ?", (start, end)).fetchone()["total"]
+    workshop = connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE branch_id=? AND category = 'taller' AND income_date BETWEEN ? AND ?", (current_branch_id(), start, end)).fetchone()["total"]
+    invoices_total = connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM invoices WHERE branch_id=? AND status = 'pagada' AND paid_date BETWEEN ? AND ?", (current_branch_id(), start, end)).fetchone()["total"]
     return float(workshop + invoices_total) * 0.01
 
 
 def is_closed(entry_date: str) -> bool:
-    return bool(db().execute("SELECT 1 FROM day_closures WHERE closure_date = ?", (entry_date,)).fetchone())
+    return bool(db().execute("SELECT 1 FROM day_closures WHERE closure_date = ? AND branch_id=?", (entry_date, current_branch_id())).fetchone())
 
 
 def can_manage_income(record) -> bool:
@@ -426,21 +471,21 @@ def audit(module: str, action: str, detail: str):
     """Registers the responsible logged-in user for each business action."""
     actor_id = session.get("user_id")
     if actor_id:
-        db().execute("INSERT INTO audit_logs (actor_id, module, action, detail) VALUES (?, ?, ?, ?)", (actor_id, module, action, detail))
+        db().execute("INSERT INTO audit_logs (actor_id, module, action, detail, branch_id) VALUES (?, ?, ?, ?, ?)", (actor_id, module, action, detail, current_branch_id()))
 
 
 def refresh_vehicle_availability():
     """Updates vehicle availability from active reservations and their return dates."""
     connection = db()
     today = date.today().isoformat()
-    vehicles = connection.execute("SELECT id, status FROM vehicles WHERE active = 1 AND status IN ('disponible', 'reservado', 'rentado')").fetchall()
+    vehicles = connection.execute("SELECT id, status FROM vehicles WHERE active = 1 AND branch_id=? AND status IN ('disponible', 'reservado', 'rentado')", (current_branch_id(),)).fetchall()
     changed = False
     for vehicle in vehicles:
         booking = connection.execute("""
             SELECT rental_state FROM vehicle_reservations
-            WHERE vehicle_id = ? AND status = 'activa' AND COALESCE(end_date, reservation_date) > ?
+            WHERE vehicle_id = ? AND branch_id=? AND status = 'activa' AND COALESCE(end_date, reservation_date) > ?
             ORDER BY COALESCE(end_date, reservation_date) DESC, id DESC LIMIT 1
-        """, (vehicle["id"], today)).fetchone()
+        """, (vehicle["id"], current_branch_id(), today)).fetchone()
         desired_status = booking["rental_state"] if booking else "disponible"
         if booking and desired_status not in ("reservado", "rentado"):
             desired_status = "reservado"
@@ -455,8 +500,8 @@ def vehicle_is_unavailable(vehicle_id: int | None, exclude_reservation_id: int |
     """A vehicle with an active future reservation/rental cannot be assigned twice."""
     if not vehicle_id:
         return False
-    query = "SELECT 1 FROM vehicle_reservations WHERE vehicle_id = ? AND status = 'activa' AND COALESCE(end_date, reservation_date) > ?"
-    params = [vehicle_id, date.today().isoformat()]
+    query = "SELECT 1 FROM vehicle_reservations WHERE vehicle_id = ? AND branch_id=? AND status = 'activa' AND COALESCE(end_date, reservation_date) > ?"
+    params = [vehicle_id, current_branch_id(), date.today().isoformat()]
     if exclude_reservation_id:
         query += " AND id != ?"
         params.append(exclude_reservation_id)
@@ -471,7 +516,7 @@ def login():
         user = db().execute("SELECT * FROM users WHERE username = ?", (request.form.get("username", "").strip(),)).fetchone()
         if user and user["active"] and check_password_hash(user["password_hash"], request.form.get("password", "")):
             session.clear()
-            session.update(user_id=user["id"], username=user["username"], role=user["role"])
+            session.update(user_id=user["id"], username=user["username"], role=user["role"], branch_id=user["branch_id"])
             return redirect(url_for("dashboard"))
         flash("Usuario o contraseña incorrectos.", "danger")
     return render_template("login.html")
@@ -483,6 +528,21 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.route("/sucursales/<int:branch_id>/cambiar", methods=["POST"])
+@login_required
+@admin_required
+def switch_branch(branch_id):
+    branch = db().execute("SELECT * FROM branches WHERE id=? AND active=1", (branch_id,)).fetchone()
+    if not branch:
+        flash("La sucursal seleccionada no está disponible.", "warning")
+    else:
+        session["branch_id"] = branch["id"]
+        audit("Sucursales", "Cambió sucursal activa", branch["name"])
+        db().commit()
+        flash(f"Ahora está trabajando en {branch['name']}.", "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
 @app.route("/")
 @login_required
 def dashboard():
@@ -492,20 +552,20 @@ def dashboard():
         SELECT vehicle_reservations.*, vehicles.plate, vehicles.brand, vehicles.model
         FROM vehicle_reservations
         LEFT JOIN vehicles ON vehicles.id = vehicle_reservations.vehicle_id
-        WHERE vehicle_reservations.status = 'activa' AND vehicle_reservations.end_date = ?
+        WHERE vehicle_reservations.status = 'activa' AND vehicle_reservations.end_date = ? AND vehicle_reservations.branch_id=?
         ORDER BY vehicle_reservations.end_date, vehicle_reservations.id
-    """, ((date.today() + timedelta(days=1)).isoformat(),)).fetchall()
+    """, ((date.today() + timedelta(days=1)).isoformat(), current_branch_id())).fetchall()
     day_is_closed = is_closed(today)
     totals = db().execute("""
         SELECT category, COALESCE(SUM(amount), 0) total FROM incomes
-        WHERE income_date = ? GROUP BY category
-    """, (today,)).fetchall()
+        WHERE income_date = ? AND branch_id=? GROUP BY category
+    """, (today, current_branch_id())).fetchall()
     data = {row["category"]: row["total"] for row in totals}
-    reservations_total = db().execute("SELECT COALESCE(SUM(deposit), 0) AS total FROM vehicle_reservations WHERE reservation_date = ? AND status = 'activa'", (today,)).fetchone()["total"]
-    expenses_total = db().execute("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE expense_date = ?", (today,)).fetchone()["total"]
-    recent = [dict(row, entry_date=row["income_date"], entry_type="ingreso") for row in db().execute("SELECT * FROM incomes WHERE income_date = ? ORDER BY id DESC", (today,)).fetchall()]
-    recent += [dict(row, entry_date=row["expense_date"], entry_type="gasto", category="gasto") for row in db().execute("SELECT * FROM expenses WHERE expense_date = ? ORDER BY id DESC", (today,)).fetchall()]
-    recent += [dict(row, entry_date=row["reservation_date"], entry_type="reserva", category="reserva", description=f"Reserva: {row['concept']}", amount=row["deposit"], observations=row["client_name"]) for row in db().execute("SELECT * FROM vehicle_reservations WHERE reservation_date = ? AND status = 'activa' ORDER BY id DESC", (today,)).fetchall()]
+    reservations_total = db().execute("SELECT COALESCE(SUM(deposit), 0) AS total FROM vehicle_reservations WHERE reservation_date = ? AND status = 'activa' AND branch_id=?", (today, current_branch_id())).fetchone()["total"]
+    expenses_total = db().execute("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE expense_date = ? AND branch_id=?", (today, current_branch_id())).fetchone()["total"]
+    recent = [dict(row, entry_date=row["income_date"], entry_type="ingreso") for row in db().execute("SELECT * FROM incomes WHERE income_date = ? AND branch_id=? ORDER BY id DESC", (today, current_branch_id())).fetchall()]
+    recent += [dict(row, entry_date=row["expense_date"], entry_type="gasto", category="gasto") for row in db().execute("SELECT * FROM expenses WHERE expense_date = ? AND branch_id=? ORDER BY id DESC", (today, current_branch_id())).fetchall()]
+    recent += [dict(row, entry_date=row["reservation_date"], entry_type="reserva", category="reserva", description=f"Reserva: {row['concept']}", amount=row["deposit"], observations=row["client_name"]) for row in db().execute("SELECT * FROM vehicle_reservations WHERE reservation_date = ? AND status = 'activa' AND branch_id=? ORDER BY id DESC", (today, current_branch_id())).fetchall()]
     recent.sort(key=lambda row: (str(row["entry_date"]), row["id"]), reverse=True)
     if day_is_closed:
         data, expenses_total, reservations_total, recent = {}, 0, 0, []
@@ -534,8 +594,8 @@ def new_income():
         if is_closed(income_date):
             flash("No puede agregar movimientos: ese día ya fue cerrado.", "danger")
             return render_template("income_form.html", record=None)
-        db().execute("INSERT INTO incomes (category, description, amount, observations, income_date, rental_start, rental_end, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                     (category, description, amount, observations, income_date, rental_start if category == "renta" else None, rental_end if category == "renta" else None, session["user_id"]))
+        db().execute("INSERT INTO incomes (category, description, amount, observations, income_date, rental_start, rental_end, created_by, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (category, description, amount, observations, income_date, rental_start if category == "renta" else None, rental_end if category == "renta" else None, session["user_id"], current_branch_id()))
         audit("Ingresos", "Registró ingreso", f"{category.title()}: {description} — ${amount:.2f} ({income_date})")
         db().commit()
         flash("Ingreso guardado correctamente.", "success")
@@ -546,7 +606,7 @@ def new_income():
 @app.route("/ingresos/<int:income_id>/editar", methods=["GET", "POST"])
 @login_required
 def edit_income(income_id):
-    record = db().execute("SELECT * FROM incomes WHERE id = ?", (income_id,)).fetchone()
+    record = db().execute("SELECT * FROM incomes WHERE id = ? AND branch_id=?", (income_id, current_branch_id())).fetchone()
     if not record:
         flash("No se encontró el ingreso solicitado.", "warning")
         return redirect(url_for("reports"))
@@ -582,7 +642,7 @@ def edit_income(income_id):
 @app.route("/ingresos/<int:income_id>/eliminar", methods=["POST"])
 @login_required
 def delete_income(income_id):
-    record = db().execute("SELECT * FROM incomes WHERE id = ?", (income_id,)).fetchone()
+    record = db().execute("SELECT * FROM incomes WHERE id = ? AND branch_id=?", (income_id, current_branch_id())).fetchone()
     if not record or not can_manage_income(record):
         flash("No tiene permiso para eliminar ese registro.", "danger")
     elif is_closed(record["income_date"]):
@@ -596,7 +656,7 @@ def delete_income(income_id):
 @app.route("/ingresos/<int:income_id>/recibo")
 @login_required
 def receipt(income_id):
-    record = db().execute("SELECT incomes.*, users.username FROM incomes JOIN users ON users.id = incomes.created_by WHERE incomes.id = ?", (income_id,)).fetchone()
+    record = db().execute("SELECT incomes.*, users.username FROM incomes JOIN users ON users.id = incomes.created_by WHERE incomes.id = ? AND incomes.branch_id=?", (income_id, current_branch_id())).fetchone()
     if not record:
         flash("No se encontró el recibo.", "warning")
         return redirect(url_for("reports"))
@@ -612,17 +672,17 @@ def clients():
         if not name:
             flash("El nombre del cliente es obligatorio.", "danger")
         else:
-            db().execute("INSERT INTO clients (name, phone, document_id, address, notes) VALUES (?, ?, ?, ?, ?)", (name, request.form.get("phone", "").strip(), request.form.get("document_id", "").strip(), request.form.get("address", "").strip(), request.form.get("notes", "").strip()))
+            db().execute("INSERT INTO clients (name, phone, document_id, address, notes, branch_id) VALUES (?, ?, ?, ?, ?, ?)", (name, request.form.get("phone", "").strip(), request.form.get("document_id", "").strip(), request.form.get("address", "").strip(), request.form.get("notes", "").strip(), current_branch_id()))
             audit("Clientes", "Registró cliente", name); db().commit(); flash("Cliente agregado.", "success")
             return redirect(url_for("clients"))
-    return render_template("clients.html", records=db().execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall())
+    return render_template("clients.html", records=db().execute("SELECT * FROM clients WHERE active = 1 AND branch_id=? ORDER BY name", (current_branch_id(),)).fetchall())
 
 
 @app.route("/clientes/<int:client_id>/editar", methods=["GET", "POST"])
 @login_required
 @admin_required
 def edit_client(client_id):
-    record = db().execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+    record = db().execute("SELECT * FROM clients WHERE id = ? AND branch_id=?", (client_id, current_branch_id())).fetchone()
     if not record:
         flash("Cliente no encontrado.", "warning")
         return redirect(url_for("clients"))
@@ -644,7 +704,7 @@ def edit_client(client_id):
 @login_required
 @admin_required
 def delete_client(client_id):
-    record = db().execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone()
+    record = db().execute("SELECT * FROM clients WHERE id = ? AND branch_id=?", (client_id, current_branch_id())).fetchone()
     if not record:
         flash("Cliente no encontrado.", "warning")
     elif db().execute("SELECT 1 FROM vehicle_reservations WHERE client_id = ? LIMIT 1", (client_id,)).fetchone():
@@ -673,19 +733,19 @@ def vehicles():
             flash("Placa, marca y modelo son obligatorios.", "danger")
         else:
             try:
-                db().execute("INSERT INTO vehicles (plate, brand, model, year, color, daily_rate, status, notes) VALUES (?, ?, ?, ?, ?, ?, 'disponible', ?)", (plate, brand, model, request.form.get("year") or None, request.form.get("color", "").strip(), daily_rate or None, request.form.get("notes", "").strip()))
+                db().execute("INSERT INTO vehicles (plate, brand, model, year, color, daily_rate, status, notes, branch_id) VALUES (?, ?, ?, ?, ?, ?, 'disponible', ?, ?)", (plate, brand, model, request.form.get("year") or None, request.form.get("color", "").strip(), daily_rate or None, request.form.get("notes", "").strip(), current_branch_id()))
                 audit("Vehículos", "Registró vehículo", f"{plate} — {brand} {model}"); db().commit(); flash("Vehículo agregado.", "success")
             except Exception:
                 flash("Ya existe un vehículo con esa placa.", "danger")
     refresh_vehicle_availability()
-    return render_template("vehicles.html", records=db().execute("SELECT * FROM vehicles WHERE active = 1 ORDER BY plate").fetchall())
+    return render_template("vehicles.html", records=db().execute("SELECT * FROM vehicles WHERE active = 1 AND branch_id=? ORDER BY plate", (current_branch_id(),)).fetchall())
 
 
 @app.route("/vehiculos/<int:vehicle_id>/editar", methods=["GET", "POST"])
 @login_required
 @admin_required
 def edit_vehicle(vehicle_id):
-    record = db().execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+    record = db().execute("SELECT * FROM vehicles WHERE id = ? AND branch_id=?", (vehicle_id, current_branch_id())).fetchone()
     if not record:
         flash("Vehículo no encontrado.", "warning")
         return redirect(url_for("vehicles"))
@@ -717,7 +777,7 @@ def edit_vehicle(vehicle_id):
 @login_required
 @admin_required
 def delete_vehicle(vehicle_id):
-    record = db().execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+    record = db().execute("SELECT * FROM vehicles WHERE id = ? AND branch_id=?", (vehicle_id, current_branch_id())).fetchone()
     if not record:
         flash("Vehículo no encontrado.", "warning")
     elif db().execute("SELECT 1 FROM vehicle_reservations WHERE vehicle_id = ? LIMIT 1", (vehicle_id,)).fetchone():
@@ -744,7 +804,7 @@ def reservations():
         end_date = request.form.get("end_date", "").strip()
         client_id = request.form.get("client_id", type=int)
         vehicle_id = request.form.get("vehicle_id", type=int)
-        client = connection.execute("SELECT * FROM clients WHERE id = ?", (client_id,)).fetchone() if client_id else None
+        client = connection.execute("SELECT * FROM clients WHERE id = ? AND branch_id=?", (client_id, current_branch_id())).fetchone() if client_id else None
         valid = True
         try:
             total, deposit, days_total = float(request.form.get("total_amount", 0)), float(request.form.get("deposit", 0)), int(request.form.get("days_total", 1))
@@ -760,22 +820,22 @@ def reservations():
         elif valid:
             remaining = total - deposit
             rental_state = "rentado" if total > 0 and remaining <= 0 else "reservado"
-            connection.execute("INSERT INTO vehicle_reservations (reservation_date, start_date, end_date, client_id, client_name, phone, vehicle_id, concept, total_amount, deposit, days_total, remaining, notes, folder_id, rental_state, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (reservation_date, start_date, end_date, client_id, client["name"], request.form.get("phone", client["phone"] or "").strip(), vehicle_id, request.form.get("concept").strip(), total, deposit, days_total, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), rental_state, session["user_id"]))
+            connection.execute("INSERT INTO vehicle_reservations (reservation_date, start_date, end_date, client_id, client_name, phone, vehicle_id, concept, total_amount, deposit, days_total, remaining, notes, folder_id, rental_state, created_by, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (reservation_date, start_date, end_date, client_id, client["name"], request.form.get("phone", client["phone"] or "").strip(), vehicle_id, request.form.get("concept").strip(), total, deposit, days_total, remaining, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), rental_state, session["user_id"], current_branch_id()))
             if vehicle_id: connection.execute("UPDATE vehicles SET status = ? WHERE id = ?", (rental_state, vehicle_id))
             audit("Reservas", "Registró reserva", f"{client['name']}: abono ${deposit:.2f}, saldo ${remaining:.2f}, estado {rental_state} ({reservation_date})"); connection.commit()
             flash("Reserva y abono registrados.", "success"); return redirect(url_for("reservations"))
-    records = connection.execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id = vehicle_reservations.vehicle_id ORDER BY reservation_date DESC, id DESC LIMIT 100").fetchall()
-    return render_template("reservations.html", records=records, clients=connection.execute("SELECT * FROM clients WHERE active = 1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active = 1 AND status = 'disponible' ORDER BY plate").fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
+    records = connection.execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id = vehicle_reservations.vehicle_id WHERE vehicle_reservations.branch_id=? ORDER BY reservation_date DESC, id DESC LIMIT 100", (current_branch_id(),)).fetchall()
+    return render_template("reservations.html", records=records, clients=connection.execute("SELECT * FROM clients WHERE active = 1 AND branch_id=? ORDER BY name", (current_branch_id(),)).fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active = 1 AND status = 'disponible' AND branch_id=? ORDER BY plate", (current_branch_id(),)).fetchall(), folders=connection.execute("SELECT * FROM reservation_folders WHERE branch_id=? ORDER BY month_key DESC", (current_branch_id(),)).fetchall())
 
 
 @app.route("/reservas/<int:reservation_id>/editar", methods=["GET", "POST"])
 @login_required
 def edit_reservation(reservation_id):
-    connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=?", (reservation_id,)).fetchone()
+    connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=? AND branch_id=?", (reservation_id, current_branch_id())).fetchone()
     if not record: flash("Reserva no encontrada.", "warning"); return redirect(url_for("reservations"))
     if request.method == "POST":
         try:
-            total, deposit, days = float(request.form.get("total_amount", 0)), float(request.form.get("deposit", 0)), int(request.form.get("days_total", 0)); client_id = request.form.get("client_id", type=int); vehicle_id = request.form.get("vehicle_id", type=int); client = connection.execute("SELECT * FROM clients WHERE id=?", (client_id,)).fetchone(); start, end = request.form.get("start_date"), request.form.get("end_date"); assert client and total >= 0 and 0 <= deposit <= total and days > 0 and start and end and parse_date(start) <= parse_date(end)
+            total, deposit, days = float(request.form.get("total_amount", 0)), float(request.form.get("deposit", 0)), int(request.form.get("days_total", 0)); client_id = request.form.get("client_id", type=int); vehicle_id = request.form.get("vehicle_id", type=int); client = connection.execute("SELECT * FROM clients WHERE id=? AND branch_id=?", (client_id, current_branch_id())).fetchone(); start, end = request.form.get("start_date"), request.form.get("end_date"); assert client and total >= 0 and 0 <= deposit <= total and days > 0 and start and end and parse_date(start) <= parse_date(end)
         except (ValueError, AssertionError):
             flash("Revise cliente, fechas, días y montos.", "danger")
         else:
@@ -789,13 +849,13 @@ def edit_reservation(reservation_id):
                 audit("Reservas", "Editó reserva", f"Reserva #{reservation_id}: {client['name']} — abono ${deposit:.2f}, saldo ${remaining:.2f}, estado {rental_state}"); connection.commit()
                 if old_vehicle and old_vehicle != vehicle_id: refresh_vehicle_availability()
                 flash("Reserva actualizada. Al completar el saldo, el vehículo quedó marcado como rentado.", "success"); return redirect(url_for("reservations"))
-    return render_template("reservation_form.html", record=record, clients=connection.execute("SELECT * FROM clients WHERE active=1 ORDER BY name").fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active=1 AND (status='disponible' OR id=?) ORDER BY plate", (record["vehicle_id"],)).fetchall(), folders=connection.execute("SELECT * FROM reservation_folders ORDER BY month_key DESC").fetchall())
+    return render_template("reservation_form.html", record=record, clients=connection.execute("SELECT * FROM clients WHERE active=1 AND branch_id=? ORDER BY name", (current_branch_id(),)).fetchall(), vehicles=connection.execute("SELECT * FROM vehicles WHERE active=1 AND branch_id=? AND (status='disponible' OR id=?) ORDER BY plate", (current_branch_id(), record["vehicle_id"])).fetchall(), folders=connection.execute("SELECT * FROM reservation_folders WHERE branch_id=? ORDER BY month_key DESC", (current_branch_id(),)).fetchall())
 
 
 @app.route("/reservas/<int:reservation_id>/eliminar", methods=["POST"])
 @login_required
 def delete_reservation(reservation_id):
-    connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=?", (reservation_id,)).fetchone()
+    connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=? AND branch_id=?", (reservation_id, current_branch_id())).fetchone()
     if record:
         connection.execute("DELETE FROM vehicle_reservations WHERE id=?", (reservation_id,))
         audit("Reservas", "Eliminó reserva", f"Reserva #{reservation_id}: {record['client_name']}"); connection.commit()
@@ -810,7 +870,7 @@ def delete_reservation(reservation_id):
 def create_reservation_folder():
     month_key = request.form.get("month_key", "").strip(); name = request.form.get("name", "").strip() or f"Reservas {month_key}"
     try:
-        datetime.strptime(month_key, "%Y-%m"); db().execute("INSERT INTO reservation_folders (name, month_key, created_by) VALUES (?, ?, ?)", (name, month_key, session["user_id"])); audit("Reservas", "Creó carpeta", f"{name} ({month_key})"); db().commit(); flash("Carpeta de reservas creada.", "success")
+        datetime.strptime(month_key, "%Y-%m"); db().execute("INSERT INTO reservation_folders (name, month_key, created_by, branch_id) VALUES (?, ?, ?, ?)", (name, month_key, session["user_id"], current_branch_id())); audit("Reservas", "Creó carpeta", f"{name} ({month_key})"); db().commit(); flash("Carpeta de reservas creada.", "success")
     except Exception: flash("No se pudo crear la carpeta; el mes y el nombre deben ser únicos.", "danger")
     return redirect(url_for("reservations"))
 
@@ -818,9 +878,9 @@ def create_reservation_folder():
 @app.route("/reservas/carpetas/<int:folder_id>/zip")
 @login_required
 def download_reservation_folder(folder_id):
-    folder = db().execute("SELECT * FROM reservation_folders WHERE id=?", (folder_id,)).fetchone()
+    folder = db().execute("SELECT * FROM reservation_folders WHERE id=? AND branch_id=?", (folder_id, current_branch_id())).fetchone()
     if not folder: flash("Carpeta no encontrada.", "warning"); return redirect(url_for("reservations"))
-    records = db().execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id=vehicle_reservations.vehicle_id WHERE folder_id=? ORDER BY reservation_date, id", (folder_id,)).fetchall()
+    records = db().execute("SELECT vehicle_reservations.*, vehicles.plate FROM vehicle_reservations LEFT JOIN vehicles ON vehicles.id=vehicle_reservations.vehicle_id WHERE folder_id=? AND vehicle_reservations.branch_id=? ORDER BY reservation_date, id", (folder_id, current_branch_id())).fetchall()
     workbook = excel_file(f"Reservas — {folder['name']}", ["Registro", "Desde", "Hasta", "Cliente", "Vehículo", "Total", "Abono", "Saldo", "Concepto"], [[r["reservation_date"], r["start_date"], r["end_date"], r["client_name"], r["plate"] or "", float(r["total_amount"]), float(r["deposit"]), float(r["remaining"]), r["concept"]] for r in records], currency_columns=(6, 7, 8))
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive: archive.writestr(f"{secure_filename(folder['name']) or 'reservas'}.xlsx", workbook.getvalue())
@@ -843,7 +903,7 @@ def new_expense():
             flash("No puede agregar gastos: ese día ya fue cerrado.", "danger")
             return render_template("expense_form.html", record=None)
         category = request.form.get("category", "Otros").strip() or "Otros"
-        db().execute("INSERT INTO expenses (description, amount, observations, category, expense_date, created_by) VALUES (?, ?, ?, ?, ?, ?)", (description, amount, request.form.get("observations", "").strip(), category, expense_date, session["user_id"]))
+        db().execute("INSERT INTO expenses (description, amount, observations, category, expense_date, created_by, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?)", (description, amount, request.form.get("observations", "").strip(), category, expense_date, session["user_id"], current_branch_id()))
         audit("Gastos", "Registró gasto", f"{description} — ${amount:.2f} ({expense_date})")
         db().commit()
         flash("Gasto registrado correctamente.", "success")
@@ -854,7 +914,7 @@ def new_expense():
 @app.route("/gastos/<int:expense_id>/editar", methods=["GET", "POST"])
 @login_required
 def edit_expense(expense_id):
-    record = db().execute("SELECT * FROM expenses WHERE id = ?", (expense_id,)).fetchone()
+    record = db().execute("SELECT * FROM expenses WHERE id = ? AND branch_id=?", (expense_id, current_branch_id())).fetchone()
     if not record or not can_manage_income(record):
         flash("No tiene permiso para editar este gasto.", "danger"); return redirect(url_for("reports"))
     if is_closed(record["expense_date"]):
@@ -876,7 +936,7 @@ def edit_expense(expense_id):
 @app.route("/gastos/<int:expense_id>/eliminar", methods=["POST"])
 @login_required
 def delete_expense(expense_id):
-    record = db().execute("SELECT * FROM expenses WHERE id = ?", (expense_id,)).fetchone()
+    record = db().execute("SELECT * FROM expenses WHERE id = ? AND branch_id=?", (expense_id, current_branch_id())).fetchone()
     if not record or not can_manage_income(record): flash("No tiene permiso para eliminar ese gasto.", "danger")
     elif is_closed(record["expense_date"]): flash("No se puede eliminar un gasto de un día cerrado.", "danger")
     else:
@@ -898,14 +958,14 @@ def invoices():
             flash("Indique una descripción y monto válido.", "danger")
         else:
             folder_id = request.form.get("folder_id", type=int)
-            db().execute("INSERT INTO invoices (description, amount, paid_date, notes, folder_id, created_by) VALUES (?, ?, ?, ?, ?, ?)",
-                         (description, amount, parse_date(request.form.get("paid_date")).isoformat(), request.form.get("notes", "").strip(), folder_id, session["user_id"]))
+            db().execute("INSERT INTO invoices (description, amount, paid_date, notes, folder_id, created_by, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (description, amount, parse_date(request.form.get("paid_date")).isoformat(), request.form.get("notes", "").strip(), folder_id, session["user_id"], current_branch_id()))
             audit("Facturas", "Registró factura pagada", f"{description} — ${amount:.2f} ({parse_date(request.form.get('paid_date')).isoformat()})")
             db().commit()
             flash("Factura pagada registrada. Cuenta para las comisiones.", "success")
             return redirect(url_for("invoices"))
-    records = db().execute("SELECT invoices.*, invoice_folders.name AS folder_name FROM invoices LEFT JOIN invoice_folders ON invoice_folders.id=invoices.folder_id ORDER BY paid_date DESC, invoices.id DESC LIMIT 100").fetchall()
-    folders = db().execute("SELECT * FROM invoice_folders ORDER BY month_key DESC, name").fetchall()
+    records = db().execute("SELECT invoices.*, invoice_folders.name AS folder_name FROM invoices LEFT JOIN invoice_folders ON invoice_folders.id=invoices.folder_id WHERE invoices.branch_id=? ORDER BY paid_date DESC, invoices.id DESC LIMIT 100", (current_branch_id(),)).fetchall()
+    folders = db().execute("SELECT * FROM invoice_folders WHERE branch_id=? ORDER BY month_key DESC, name", (current_branch_id(),)).fetchall()
     return render_template("invoices.html", records=records, folders=folders)
 
 
@@ -918,7 +978,7 @@ def create_invoice_folder():
     try:
         datetime.strptime(month_key, "%Y-%m")
         assert name
-        db().execute("INSERT INTO invoice_folders (name, month_key, created_by) VALUES (?, ?, ?)", (name, month_key, session["user_id"]))
+        db().execute("INSERT INTO invoice_folders (name, month_key, created_by, branch_id) VALUES (?, ?, ?, ?)", (name, month_key, session["user_id"], current_branch_id()))
         audit("Facturas", "Creó carpeta", f"{name} ({month_key})")
         db().commit(); flash("Carpeta mensual creada.", "success")
     except Exception:
@@ -930,11 +990,11 @@ def create_invoice_folder():
 @login_required
 @admin_required
 def edit_invoice(invoice_id):
-    record = db().execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    record = db().execute("SELECT * FROM invoices WHERE id=? AND branch_id=?", (invoice_id, current_branch_id())).fetchone()
     if not record:
         flash("Factura no encontrada.", "warning"); return redirect(url_for("invoices"))
     if request.method == "GET":
-        folders = db().execute("SELECT * FROM invoice_folders ORDER BY month_key DESC, name").fetchall()
+        folders = db().execute("SELECT * FROM invoice_folders WHERE branch_id=? ORDER BY month_key DESC, name", (current_branch_id(),)).fetchall()
         return render_template("invoice_form.html", record=record, folders=folders)
     try:
         amount = float(request.form.get("amount", 0)); description = request.form.get("description", "").strip()
@@ -952,7 +1012,7 @@ def edit_invoice(invoice_id):
 @login_required
 @admin_required
 def delete_invoice(invoice_id):
-    record = db().execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    record = db().execute("SELECT * FROM invoices WHERE id=? AND branch_id=?", (invoice_id, current_branch_id())).fetchone()
     if not record:
         flash("Factura no encontrada.", "warning")
     else:
@@ -968,7 +1028,7 @@ def delete_invoice(invoice_id):
 @login_required
 @admin_required
 def cancel_invoice(invoice_id):
-    record = db().execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    record = db().execute("SELECT * FROM invoices WHERE id=? AND branch_id=?", (invoice_id, current_branch_id())).fetchone()
     if record and record["status"] != "anulada":
         db().execute("UPDATE invoices SET status='anulada' WHERE id=?", (invoice_id,))
         audit("Facturas", "Anuló factura", f"Factura #{invoice_id}: {record['description']} — ${record['amount']:.2f}")
@@ -980,10 +1040,10 @@ def cancel_invoice(invoice_id):
 @login_required
 @admin_required
 def download_invoice_folder(folder_id):
-    folder = db().execute("SELECT * FROM invoice_folders WHERE id=?", (folder_id,)).fetchone()
+    folder = db().execute("SELECT * FROM invoice_folders WHERE id=? AND branch_id=?", (folder_id, current_branch_id())).fetchone()
     if not folder:
         flash("Carpeta no encontrada.", "warning"); return redirect(url_for("invoices"))
-    records = db().execute("SELECT * FROM invoices WHERE folder_id=? ORDER BY paid_date, id", (folder_id,)).fetchall()
+    records = db().execute("SELECT * FROM invoices WHERE folder_id=? AND branch_id=? ORDER BY paid_date, id", (folder_id, current_branch_id())).fetchall()
     workbook = excel_file(
         f"Facturas — {folder['name']}",
         ["Fecha", "Descripción", "Monto", "Estado", "Notas"],
@@ -1004,8 +1064,8 @@ def download_invoice_folder(folder_id):
 def commissions():
     start, end = selected_range()
     connection = db()
-    workshop = float(connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE category = 'taller' AND income_date BETWEEN ? AND ?", (start, end)).fetchone()["total"])
-    invoices_total = float(connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM invoices WHERE status='pagada' AND paid_date BETWEEN ? AND ?", (start, end)).fetchone()["total"])
+    workshop = float(connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE branch_id=? AND category = 'taller' AND income_date BETWEEN ? AND ?", (current_branch_id(), start, end)).fetchone()["total"])
+    invoices_total = float(connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM invoices WHERE branch_id=? AND status='pagada' AND paid_date BETWEEN ? AND ?", (current_branch_id(), start, end)).fetchone()["total"])
     base = workshop + invoices_total
     return render_template("commissions.html", start=start, end=end, workshop=workshop, invoices=invoices_total, base=base, commission=base * 0.01)
 
@@ -1015,20 +1075,20 @@ def commissions():
 def reports():
     start, end = selected_range()
     category = request.args.get("category", "todos")
-    clauses, parameters = ["income_date BETWEEN ? AND ?"], [start, end]
+    clauses, parameters = ["income_date BETWEEN ? AND ?", "branch_id=?"], [start, end, current_branch_id()]
     if category in ("renta", "taller", "lavado"):
         clauses.append("category = ?")
         parameters.append(category)
     income_records = db().execute(f"SELECT * FROM incomes WHERE {' AND '.join(clauses)}", parameters).fetchall() if category not in ("gasto", "reserva") else []
-    expense_records = db().execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ?", (start, end)).fetchall() if category in ("todos", "gasto") else []
+    expense_records = db().execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ? AND branch_id=?", (start, end, current_branch_id())).fetchall() if category in ("todos", "gasto") else []
     records = [dict(row, entry_date=row["income_date"], entry_type="ingreso") for row in income_records]
     records += [dict(row, entry_date=row["expense_date"], entry_type="gasto", category="gasto") for row in expense_records]
     if category in ("todos", "reserva"):
-        records += [dict(row, entry_date=row["reservation_date"], entry_type="reserva", category="reserva", description=f"Reserva: {row['concept']}", amount=row["deposit"], observations=f"Cliente: {row['client_name']}") for row in db().execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ?", (start, end)).fetchall()]
+        records += [dict(row, entry_date=row["reservation_date"], entry_type="reserva", category="reserva", description=f"Reserva: {row['concept']}", amount=row["deposit"], observations=f"Cliente: {row['client_name']}") for row in db().execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? AND branch_id=?", (start, end, current_branch_id())).fetchall()]
     records.sort(key=lambda row: (str(row["entry_date"]), row["id"]), reverse=True)
     totals = {"renta": 0, "taller": 0, "lavado": 0, "reserva": 0, "gasto": 0}
     for row in records: totals[row["category"]] += row["amount"]
-    folders = db().execute("SELECT * FROM report_folders ORDER BY month_key DESC, name").fetchall()
+    folders = db().execute("SELECT * FROM report_folders WHERE branch_id=? ORDER BY month_key DESC, name", (current_branch_id(),)).fetchall()
     return render_template("reports.html", records=records, start=start, end=end, category=category, totals=totals, folders=folders)
 
 
@@ -1040,7 +1100,7 @@ def create_report_folder():
     name = request.form.get("name", "").strip() or f"Reporte {month_key}"
     try:
         datetime.strptime(month_key, "%Y-%m")
-        db().execute("INSERT INTO report_folders (name, month_key, created_by) VALUES (?, ?, ?)", (name, month_key, session["user_id"]))
+        db().execute("INSERT INTO report_folders (name, month_key, created_by, branch_id) VALUES (?, ?, ?, ?)", (name, month_key, session["user_id"], current_branch_id()))
         audit("Reportes", "Creó carpeta mensual", f"{name} ({month_key})")
         db().commit()
         flash("Carpeta mensual de reportes creada.", "success")
@@ -1053,7 +1113,7 @@ def create_report_folder():
 @login_required
 @admin_required
 def download_report_folder(folder_id):
-    folder = db().execute("SELECT * FROM report_folders WHERE id = ?", (folder_id,)).fetchone()
+    folder = db().execute("SELECT * FROM report_folders WHERE id = ? AND branch_id=?", (folder_id, current_branch_id())).fetchone()
     if not folder:
         flash("Carpeta de reportes no encontrada.", "warning")
         return redirect(url_for("reports"))
@@ -1062,9 +1122,9 @@ def download_report_folder(folder_id):
     month_end = next_month - timedelta(days=1)
     start, end = month_start.isoformat(), month_end.isoformat()
     connection = db()
-    incomes = connection.execute("SELECT * FROM incomes WHERE income_date BETWEEN ? AND ? ORDER BY income_date, id", (start, end)).fetchall()
-    expenses = connection.execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ? ORDER BY expense_date, id", (start, end)).fetchall()
-    reservations = connection.execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? ORDER BY reservation_date, id", (start, end)).fetchall()
+    incomes = connection.execute("SELECT * FROM incomes WHERE income_date BETWEEN ? AND ? AND branch_id=? ORDER BY income_date, id", (start, end, current_branch_id())).fetchall()
+    expenses = connection.execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ? AND branch_id=? ORDER BY expense_date, id", (start, end, current_branch_id())).fetchall()
+    reservations = connection.execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? AND branch_id=? ORDER BY reservation_date, id", (start, end, current_branch_id())).fetchall()
     files = {
         "01_ingresos.xlsx": excel_file(f"Ingresos — {folder['name']}", ["Fecha", "Tipo", "Descripción", "Monto", "Observaciones"], [[row["income_date"], row["category"].title(), row["description"], float(row["amount"]), row["observations"]] for row in incomes], currency_columns=(4,)),
         "02_gastos.xlsx": excel_file(f"Gastos — {folder['name']}", ["Fecha", "Categoría", "Descripción", "Monto", "Observaciones"], [[row["expense_date"], row["category"], row["description"], float(row["amount"]), row["observations"]] for row in expenses], currency_columns=(4,)),
@@ -1085,15 +1145,15 @@ def download_report_folder(folder_id):
 def report_excel():
     start, end = selected_range()
     category = request.args.get("category", "todos")
-    query, params = "SELECT * FROM incomes WHERE income_date BETWEEN ? AND ?", [start, end]
+    query, params = "SELECT * FROM incomes WHERE income_date BETWEEN ? AND ? AND branch_id=?", [start, end, current_branch_id()]
     if category in ("renta", "taller", "lavado"):
         query += " AND category = ?"; params.append(category)
     income_rows = db().execute(query + " ORDER BY income_date, id", params).fetchall() if category not in ("gasto", "reserva") else []
-    expense_rows = db().execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ? ORDER BY expense_date, id", (start, end)).fetchall() if category in ("todos", "gasto") else []
+    expense_rows = db().execute("SELECT * FROM expenses WHERE expense_date BETWEEN ? AND ? AND branch_id=? ORDER BY expense_date, id", (start, end, current_branch_id())).fetchall() if category in ("todos", "gasto") else []
     rows = [[r["income_date"], "Ingreso", r["category"].title(), r["description"], float(r["amount"]), r["observations"]] for r in income_rows]
     rows += [[r["expense_date"], "Gasto", "Gasto", r["description"], float(r["amount"]), r["observations"]] for r in expense_rows]
     if category in ("todos", "reserva"):
-        rows += [[r["reservation_date"], "Reserva", "Reserva", r["concept"], float(r["deposit"]), r["client_name"]] for r in db().execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? ORDER BY reservation_date, id", (start, end)).fetchall()]
+        rows += [[r["reservation_date"], "Reserva", "Reserva", r["concept"], float(r["deposit"]), r["client_name"]] for r in db().execute("SELECT * FROM vehicle_reservations WHERE status='activa' AND reservation_date BETWEEN ? AND ? AND branch_id=? ORDER BY reservation_date, id", (start, end, current_branch_id())).fetchall()]
     workbook = excel_file(f"Reporte de movimientos — {start} al {end}", ["Fecha", "Tipo", "Área", "Descripción", "Monto", "Observaciones"], rows, currency_columns=(5,))
     return send_file(workbook, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name=f"reporte_{start}_{end}.xlsx")
 
@@ -1104,11 +1164,11 @@ def report_excel():
 def close_day():
     closure_date = parse_date(request.form.get("closure_date")).isoformat()
     connection = db()
-    if connection.execute("SELECT 1 FROM day_closures WHERE closure_date = ?", (closure_date,)).fetchone():
+    if connection.execute("SELECT 1 FROM day_closures WHERE closure_date = ? AND branch_id=?", (closure_date, current_branch_id())).fetchone():
         flash("Ese día ya fue cerrado; no se generaron archivos duplicados.", "warning")
         return redirect(url_for("dashboard"))
-    rows = connection.execute("SELECT * FROM incomes WHERE income_date = ? ORDER BY id", (closure_date,)).fetchall()
-    expenses = connection.execute("SELECT * FROM expenses WHERE expense_date = ? ORDER BY id", (closure_date,)).fetchall()
+    rows = connection.execute("SELECT * FROM incomes WHERE income_date = ? AND branch_id=? ORDER BY id", (closure_date, current_branch_id())).fetchall()
+    expenses = connection.execute("SELECT * FROM expenses WHERE expense_date = ? AND branch_id=? ORDER BY id", (closure_date, current_branch_id())).fetchall()
     for category, folder, label in (("taller", "taller", "Taller"), ("renta", "rentas", "Rentas"), ("lavado", "lavados", "Lavados")):
         path = EXPORT_DIR / folder; path.mkdir(parents=True, exist_ok=True)
         workbook = excel_file(
@@ -1126,7 +1186,7 @@ def close_day():
         currency_columns=(3,),
     )
     (path / f"{closure_date}.xlsx").write_bytes(workbook.getvalue())
-    reservations = connection.execute("SELECT * FROM vehicle_reservations WHERE reservation_date=? AND status='activa' ORDER BY id", (closure_date,)).fetchall()
+    reservations = connection.execute("SELECT * FROM vehicle_reservations WHERE reservation_date=? AND status='activa' AND branch_id=? ORDER BY id", (closure_date, current_branch_id())).fetchall()
     path = EXPORT_DIR / "reservas"; path.mkdir(parents=True, exist_ok=True)
     workbook = excel_file(
         f"Cierre diario — Reservas — {closure_date}",
@@ -1135,7 +1195,7 @@ def close_day():
         currency_columns=(4, 5),
     )
     (path / f"{closure_date}.xlsx").write_bytes(workbook.getvalue())
-    connection.execute("INSERT INTO day_closures (closure_date, closed_by) VALUES (?, ?)", (closure_date, session["user_id"]))
+    connection.execute("INSERT INTO day_closures (closure_date, closed_by, branch_id) VALUES (?, ?, ?)", (closure_date, session["user_id"], current_branch_id()))
     audit("Cierres", "Cerró día", f"Cierre de caja del {closure_date}. Archivos generados: taller, rentas, lavados, reservas y gastos.")
     connection.commit()
     flash("Día cerrado. Se crearon los archivos de taller, rentas, lavados, reservas y gastos.", "success")
@@ -1146,7 +1206,7 @@ def close_day():
 @login_required
 @admin_required
 def closures():
-    records = db().execute("SELECT day_closures.*, users.username FROM day_closures JOIN users ON users.id = day_closures.closed_by ORDER BY closure_date DESC").fetchall()
+    records = db().execute("SELECT day_closures.*, users.username FROM day_closures JOIN users ON users.id = day_closures.closed_by WHERE day_closures.branch_id=? ORDER BY closure_date DESC", (current_branch_id(),)).fetchall()
     return render_template("closures.html", records=records)
 
 
@@ -1255,11 +1315,11 @@ def users():
             flash("Usuario, rol y contraseña de al menos 6 caracteres son obligatorios.", "danger")
         else:
             try:
-                db().execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", (username, generate_password_hash(password), role)); audit("Usuarios", "Creó usuario", f"Usuario {username} con rol {role}"); db().commit()
+                db().execute("INSERT INTO users (username, password_hash, role, branch_id) VALUES (?, ?, ?, ?)", (username, generate_password_hash(password), role, current_branch_id())); audit("Usuarios", "Creó usuario", f"Usuario {username} con rol {role} en la sucursal actual"); db().commit()
                 flash("Usuario creado.", "success")
             except Exception:
                 flash("Ese nombre de usuario ya existe.", "danger")
-    return render_template("users.html", users=db().execute("SELECT id, username, role, active, created_at FROM users ORDER BY username").fetchall())
+    return render_template("users.html", users=db().execute("SELECT users.id, users.username, users.role, users.active, users.created_at, branches.name AS branch_name FROM users LEFT JOIN branches ON branches.id=users.branch_id ORDER BY username").fetchall())
 
 
 @app.route("/usuarios/<int:user_id>/estado", methods=["POST"])
@@ -1340,13 +1400,14 @@ def delete_user(user_id):
 def audit_log():
     module = request.args.get("module", "todos")
     params = []
-    query = "SELECT audit_logs.*, users.username FROM audit_logs JOIN users ON users.id = audit_logs.actor_id"
+    query = "SELECT audit_logs.*, users.username FROM audit_logs JOIN users ON users.id = audit_logs.actor_id WHERE audit_logs.branch_id=?"
+    params.append(current_branch_id())
     if module != "todos":
-        query += " WHERE audit_logs.module = ?"
+        query += " AND audit_logs.module = ?"
         params.append(module)
     query += " ORDER BY audit_logs.id DESC LIMIT 300"
     records = db().execute(query, params).fetchall()
-    modules = db().execute("SELECT DISTINCT module FROM audit_logs ORDER BY module").fetchall()
+    modules = db().execute("SELECT DISTINCT module FROM audit_logs WHERE branch_id=? ORDER BY module", (current_branch_id(),)).fetchall()
     return render_template("audit_log.html", records=records, modules=modules, module=module)
 
 
