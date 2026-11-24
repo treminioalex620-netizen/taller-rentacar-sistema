@@ -144,6 +144,7 @@ SQLITE_SCHEMA = """
             amount REAL NOT NULL CHECK(amount > 0),
             paid_date TEXT NOT NULL,
             notes TEXT,
+            client_name TEXT,
             folder_id INTEGER,
             status TEXT NOT NULL DEFAULT 'pagada',
             created_by INTEGER NOT NULL,
@@ -341,7 +342,7 @@ def init_db():
             if column not in payroll_columns:
                 connection.execute(f"ALTER TABLE payroll_payments ADD COLUMN {column} {definition}")
         invoice_columns = {row[1] for row in connection.execute("PRAGMA table_info(invoices)")}
-        for column, definition in (("folder_id", "INTEGER"), ("status", "TEXT NOT NULL DEFAULT 'pagada'")):
+        for column, definition in (("folder_id", "INTEGER"), ("status", "TEXT NOT NULL DEFAULT 'pagada'"), ("client_name", "TEXT")):
             if column not in invoice_columns:
                 connection.execute(f"ALTER TABLE invoices ADD COLUMN {column} {definition}")
         expense_columns = {row[1] for row in connection.execute("PRAGMA table_info(expenses)")}
@@ -370,6 +371,7 @@ def init_db():
         for statement in (
             "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS folder_id BIGINT",
             "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pagada'",
+            "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS client_name TEXT",
             "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'Otros'",
             "ALTER TABLE incomes ADD COLUMN IF NOT EXISTS rental_start DATE",
             "ALTER TABLE incomes ADD COLUMN IF NOT EXISTS rental_end DATE",
@@ -440,6 +442,11 @@ def current_branch_id() -> int:
     return int(session.get("branch_id", 1))
 
 
+def is_secondary_branch() -> bool:
+    """Sucursal 2 operates as a workshop-only branch with credit invoices."""
+    return current_branch_id() == 2
+
+
 def belongs_to_current_branch(record) -> bool:
     return bool(record) and record["branch_id"] == current_branch_id()
 
@@ -449,7 +456,7 @@ def inject_branch_context():
     if not session.get("user_id"):
         return {}
     branches = db().execute("SELECT * FROM branches WHERE active=1 ORDER BY name").fetchall()
-    return {"branches": branches, "current_branch_id": current_branch_id(), "current_branch_name": next((branch["name"] for branch in branches if branch["id"] == current_branch_id()), "Sucursal")}
+    return {"branches": branches, "current_branch_id": current_branch_id(), "current_branch_name": next((branch["name"] for branch in branches if branch["id"] == current_branch_id()), "Sucursal"), "is_secondary_branch": is_secondary_branch()}
 
 
 def commission_for_period(start: str, end: str) -> float:
@@ -578,6 +585,9 @@ def dashboard():
 def new_income():
     if request.method == "POST":
         category = request.form.get("category")
+        if is_secondary_branch() and category != "taller":
+            flash("La Sucursal 2 opera solo con trabajos de taller; no registra rentas ni lavados.", "warning")
+            return render_template("income_form.html", record=None)
         description = request.form.get("description", "").strip()
         observations = request.form.get("observations", "").strip()
         income_date = parse_date(request.form.get("income_date")).isoformat()
@@ -618,6 +628,9 @@ def edit_income(income_id):
         return redirect(url_for("reports"))
     if request.method == "POST":
         category, description = request.form.get("category"), request.form.get("description", "").strip()
+        if is_secondary_branch() and category != "taller":
+            flash("La Sucursal 2 opera solo con trabajos de taller.", "warning")
+            return render_template("income_form.html", record=record)
         new_date = parse_date(request.form.get("income_date")).isoformat()
         rental_start = request.form.get("rental_start", "").strip() or None
         rental_end = request.form.get("rental_end", "").strip() or None
@@ -724,6 +737,9 @@ def delete_client(client_id):
 @login_required
 @admin_required
 def vehicles():
+    if is_secondary_branch():
+        flash("El módulo de vehículos y Rentacar pertenece únicamente a la Sucursal principal.", "warning")
+        return redirect(url_for("dashboard"))
     if request.method == "POST":
         plate, brand, model = request.form.get("plate", "").strip().upper(), request.form.get("brand", "").strip(), request.form.get("model", "").strip()
         try:
@@ -745,6 +761,8 @@ def vehicles():
 @login_required
 @admin_required
 def edit_vehicle(vehicle_id):
+    if is_secondary_branch():
+        return redirect(url_for("dashboard"))
     record = db().execute("SELECT * FROM vehicles WHERE id = ? AND branch_id=?", (vehicle_id, current_branch_id())).fetchone()
     if not record:
         flash("Vehículo no encontrado.", "warning")
@@ -777,6 +795,8 @@ def edit_vehicle(vehicle_id):
 @login_required
 @admin_required
 def delete_vehicle(vehicle_id):
+    if is_secondary_branch():
+        return redirect(url_for("dashboard"))
     record = db().execute("SELECT * FROM vehicles WHERE id = ? AND branch_id=?", (vehicle_id, current_branch_id())).fetchone()
     if not record:
         flash("Vehículo no encontrado.", "warning")
@@ -796,6 +816,9 @@ def delete_vehicle(vehicle_id):
 @app.route("/reservas", methods=["GET", "POST"])
 @login_required
 def reservations():
+    if is_secondary_branch():
+        flash("La Sucursal 2 no maneja reservas ni rentas de vehículos.", "warning")
+        return redirect(url_for("dashboard"))
     connection = db()
     refresh_vehicle_availability()
     if request.method == "POST":
@@ -831,6 +854,8 @@ def reservations():
 @app.route("/reservas/<int:reservation_id>/editar", methods=["GET", "POST"])
 @login_required
 def edit_reservation(reservation_id):
+    if is_secondary_branch():
+        return redirect(url_for("dashboard"))
     connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=? AND branch_id=?", (reservation_id, current_branch_id())).fetchone()
     if not record: flash("Reserva no encontrada.", "warning"); return redirect(url_for("reservations"))
     if request.method == "POST":
@@ -855,6 +880,8 @@ def edit_reservation(reservation_id):
 @app.route("/reservas/<int:reservation_id>/eliminar", methods=["POST"])
 @login_required
 def delete_reservation(reservation_id):
+    if is_secondary_branch():
+        return redirect(url_for("dashboard"))
     connection = db(); record = connection.execute("SELECT * FROM vehicle_reservations WHERE id=? AND branch_id=?", (reservation_id, current_branch_id())).fetchone()
     if record:
         connection.execute("DELETE FROM vehicle_reservations WHERE id=?", (reservation_id,))
@@ -958,9 +985,14 @@ def invoices():
             flash("Indique una descripción y monto válido.", "danger")
         else:
             folder_id = request.form.get("folder_id", type=int)
-            db().execute("INSERT INTO invoices (description, amount, paid_date, notes, folder_id, created_by, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         (description, amount, parse_date(request.form.get("paid_date")).isoformat(), request.form.get("notes", "").strip(), folder_id, session["user_id"], current_branch_id()))
-            audit("Facturas", "Registró factura pagada", f"{description} — ${amount:.2f} ({parse_date(request.form.get('paid_date')).isoformat()})")
+            client_name = request.form.get("client_name", "").strip() if is_secondary_branch() else None
+            status = request.form.get("status", "pagada") if is_secondary_branch() else "pagada"
+            if is_secondary_branch() and (not client_name or status not in ("pagada", "pendiente")):
+                flash("Indique el cliente y si la factura quedó pagada o a crédito.", "danger")
+                return render_template("invoices.html", records=[], folders=db().execute("SELECT * FROM invoice_folders WHERE branch_id=? ORDER BY month_key DESC, name", (current_branch_id(),)).fetchall())
+            db().execute("INSERT INTO invoices (description, amount, paid_date, notes, client_name, folder_id, status, created_by, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (description, amount, parse_date(request.form.get("paid_date")).isoformat(), request.form.get("notes", "").strip(), client_name, folder_id, status, session["user_id"], current_branch_id()))
+            audit("Facturas", "Registró factura", f"{description} — ${amount:.2f}, {status}{' — '+client_name if client_name else ''}")
             db().commit()
             flash("Factura pagada registrada. Cuenta para las comisiones.", "success")
             return redirect(url_for("invoices"))
@@ -1002,7 +1034,12 @@ def edit_invoice(invoice_id):
         paid_date = parse_date(request.form.get("paid_date")).isoformat()
     except (ValueError, AssertionError):
         flash("La factura necesita descripción, fecha y monto válido.", "danger"); return redirect(url_for("edit_invoice", invoice_id=invoice_id))
-    db().execute("UPDATE invoices SET description=?, amount=?, paid_date=?, notes=?, folder_id=? WHERE id=?", (description, amount, paid_date, request.form.get("notes", "").strip(), request.form.get("folder_id", type=int), invoice_id))
+    client_name = request.form.get("client_name", "").strip() if is_secondary_branch() else record["client_name"]
+    status = request.form.get("status", record["status"]) if is_secondary_branch() else record["status"]
+    if is_secondary_branch() and (not client_name or status not in ("pagada", "pendiente")):
+        flash("Indique el cliente y un estado válido para la factura.", "danger")
+        return redirect(url_for("edit_invoice", invoice_id=invoice_id))
+    db().execute("UPDATE invoices SET description=?, amount=?, paid_date=?, notes=?, client_name=?, status=?, folder_id=? WHERE id=?", (description, amount, paid_date, request.form.get("notes", "").strip(), client_name, status, request.form.get("folder_id", type=int), invoice_id))
     audit("Facturas", "Editó factura", f"Factura #{invoice_id}: {description} — ${amount:.2f}")
     db().commit(); flash("Factura actualizada.", "success")
     return redirect(url_for("invoices"))
@@ -1046,9 +1083,9 @@ def download_invoice_folder(folder_id):
     records = db().execute("SELECT * FROM invoices WHERE folder_id=? AND branch_id=? ORDER BY paid_date, id", (folder_id, current_branch_id())).fetchall()
     workbook = excel_file(
         f"Facturas — {folder['name']}",
-        ["Fecha", "Descripción", "Monto", "Estado", "Notas"],
-        [[row["paid_date"], row["description"], float(row["amount"]), row["status"], row["notes"]] for row in records],
-        currency_columns=(3,),
+        ["Fecha", "Cliente", "Descripción", "Monto", "Estado", "Notas"],
+        [[row["paid_date"], row["client_name"] or "", row["description"], float(row["amount"]), row["status"], row["notes"]] for row in records],
+        currency_columns=(4,),
     )
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -1062,6 +1099,9 @@ def download_invoice_folder(folder_id):
 @login_required
 @admin_required
 def commissions():
+    if is_secondary_branch():
+        flash("La Sucursal 2 no utiliza comisiones.", "warning")
+        return redirect(url_for("dashboard"))
     start, end = selected_range()
     connection = db()
     workshop = float(connection.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM incomes WHERE branch_id=? AND category = 'taller' AND income_date BETWEEN ? AND ?", (current_branch_id(), start, end)).fetchone()["total"])
